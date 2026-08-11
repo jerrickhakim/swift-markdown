@@ -1,4 +1,4 @@
-# `@jerrick/swift-markdown`
+# JerrickMarkdown
 
 This package owns the native iOS counterpart to `@jerrick/markdown`: static and
 append-only streaming Markdown rendering, syntax-highlighted code, unified
@@ -14,11 +14,11 @@ diffs, tables, math, supported HTML blocks, and token-driven SwiftUI surfaces.
   selectable text behavior.
 - Runtime assets belong under `Sources/JerrickMarkdown/Resources`. Record the
   license of every bundled third-party asset in `THIRD_PARTY_NOTICES.md`.
-- npm is a source transport. SwiftPM still resolves `Package.swift` after the
-  package is installed into `node_modules`.
+- Distribute releases through Swift Package Manager using semantic Git tags.
 
 Verify changes with:
 
-```bash
-bun run check:ios
+```sh
+xcodebuild -scheme swift-markdown -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO -quiet build
 ```

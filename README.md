@@ -1,4 +1,4 @@
-# `@jerrick/swift-markdown`
+# JerrickMarkdown
 
 Native SwiftUI Markdown rendering for static documents and append-only streaming
 content. The package includes selectable text, fenced code highlighting, unified
@@ -9,22 +9,23 @@ diffs, tables, math, lists, block quotes, links, and supported HTML blocks.
 - External packages: `SwiftUIMath` and `Highlightr`
 - Runtime resources: bundled highlight.js and file-type SVG assets
 
-## Install from npm
+## Install with Swift Package Manager
 
-npm distributes the complete Swift package source, including `Package.swift`
-and its runtime resources:
+In Xcode, choose **File > Add Package Dependencies** and enter:
 
-```bash
-npm install @jerrick/swift-markdown
+```text
+https://github.com/jerrickhakim/swift-markdown.git
 ```
 
-In Xcode, choose **Add Local Package**, select
-`node_modules/@jerrick/swift-markdown`, and link the `JerrickMarkdown` product
-to the application target. Another Swift package can use the installed path:
+Link the `JerrickMarkdown` product to the application target. Another Swift
+package can declare the dependency in its manifest:
 
 ```swift
 dependencies: [
-  .package(path: "node_modules/@jerrick/swift-markdown")
+  .package(
+    url: "https://github.com/jerrickhakim/swift-markdown.git",
+    from: "0.1.0"
+  )
 ],
 targets: [
   .target(
@@ -36,14 +37,10 @@ targets: [
 ]
 ```
 
-The path is relative to the consuming `Package.swift`. npm is the remote source
-transport; Xcode and Swift Package Manager still resolve and build the Swift
-dependencies declared by the installed manifest.
-
 ## Install from a local checkout
 
-Select `packages/swift-markdown` as a local Swift package in Xcode, or use a
-relative path from another package:
+Select the repository root as a local Swift package in Xcode, or use a relative
+path from another package:
 
 ```swift
 dependencies: [
@@ -58,11 +55,6 @@ targets: [
   )
 ]
 ```
-
-Direct `.package(url:)` installation requires a dedicated Git repository whose
-root contains this manifest and whose versions are Git tags. The `@jerrick`
-monorepo does not have that shape, so use the npm install above until a dedicated
-Swift registry or repository is published.
 
 ## Render a Markdown document
 

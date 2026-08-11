@@ -1,6 +1,6 @@
 # Third-party notices
 
-`@jerrick/swift-markdown` redistributes the following assets.
+`JerrickMarkdown` redistributes the following assets.
 
 ## highlight.js 11.11.1
 
