@@ -141,11 +141,9 @@ public struct CustomMarkdownBlock: View {
     guard isStreamingTail else { return false }
     switch block {
     case .paragraph(let text, _), .heading(_, let text, _):
-      return InlineMarkdown.rendersEmpty(
-        String(StreamingMarkdownText.committedPrefix(of: text)))
+      return streamingTextRendersEmpty(text)
     case .blockQuote(let text):
-      return InlineMarkdown.rendersEmpty(
-        String(StreamingMarkdownText.committedPrefix(of: text)))
+      return streamingTextRendersEmpty(text)
     case .math(let latex, let complete):
       // A math fence that hasn't closed yet (or has no LaTeX) draws nothing —
       // keep it flat until the closing `$$` arrives and it pops in.
@@ -158,8 +156,7 @@ public struct CustomMarkdownBlock: View {
       // Only a brand-new list whose sole (still-open) item is held back is
       // flat — a list with any closed item shows at least a marker row.
       guard items.count == 1, let only = items.first, only.open else { return false }
-      return InlineMarkdown.rendersEmpty(
-        String(StreamingMarkdownText.committedPrefix(of: only.text)))
+      return streamingTextRendersEmpty(only.text)
     default:
       return false
     }
@@ -289,10 +286,7 @@ private struct MarkdownList: View {
         // row appears whole with its first committed word (additive growth),
         // and if the item turns out to be something else (a "-" that becomes
         // a thematic break), nothing was on screen to shift away.
-        if !(growing
-          && InlineMarkdown.rendersEmpty(
-            String(StreamingMarkdownText.committedPrefix(of: item.text))))
-        {
+        if !(growing && streamingTextRendersEmpty(item.text)) {
           MarkdownListItem(
             marker: item.ordered ? "\(item.index)." : Self.bulletMarker(depth: item.depth),
             depth: item.depth,
@@ -356,6 +350,9 @@ private struct MarkdownListItem: View {
 enum StreamingTablePromotion {
 
   static func parse(_ text: String) -> (header: [String], rows: [[String]])? {
+    // Ordinary prose is overwhelmingly the common path. Reject it before
+    // splitting and copying every line of the still-growing paragraph.
+    guard text.first(where: { !$0.isWhitespace }) == "|" else { return nil }
     let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     guard !lines.isEmpty else { return nil }
 
@@ -391,6 +388,24 @@ enum StreamingTablePromotion {
     if raw.hasSuffix("|") { raw = String(raw.dropLast()) }
     return raw.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
   }
+}
+
+/// `InlineMarkdown.rendersEmpty` only needs to parse tiny speculative tails.
+/// Check that bound on the Substring first so a normal growing paragraph does
+/// not get copied in full merely to prove that it is non-empty.
+private func streamingTextRendersEmpty(_ text: String) -> Bool {
+  let committed = StreamingMarkdownText.committedPrefix(of: text)
+  // `rendersEmpty` deliberately hides an incomplete HTML tag at any length.
+  // Preserve that rare case without materializing the Substring.
+  if committed.first == "<", !committed.contains(">"),
+    committed.dropFirst().allSatisfy({ $0.isLetter || $0 == "/" })
+  {
+    return true
+  }
+  let cutoff = committed.index(
+    committed.startIndex, offsetBy: 25, limitedBy: committed.endIndex)
+  guard cutoff == nil else { return false }
+  return InlineMarkdown.rendersEmpty(String(committed))
 }
 
 // MARK: - Table

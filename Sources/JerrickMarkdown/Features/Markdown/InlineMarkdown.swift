@@ -82,10 +82,12 @@ enum InlineMarkdown {
   static func traitRuns(_ markdown: String, isTail: Bool = false) -> [TraitRun] {
     guard !markdown.isEmpty else { return [] }
     if let plain = plainTraitRunsFastPath(markdown, isTail: isTail) { return plain }
+    let chars = Array(markdown)
     var tokens: [Token] = []
     var delims: [Delim] = []
+    tokens.reserveCapacity(min(chars.count / 4 + 1, 64))
     tokenize(
-      Array(markdown), isTail: isTail, linksEnabled: true,
+      chars, isTail: isTail, linksEnabled: true,
       tokens: &tokens, delims: &delims
     )
     let spans = resolveEmphasis(tokens: tokens, delims: &delims, isTail: isTail)
@@ -132,7 +134,7 @@ enum InlineMarkdown {
     if markdown.count <= 2, markdown.allSatisfy({ "-_*~`".contains($0) }) { return true }
     // An HTML tag still arriving ("<", "<deta", "</det") draws nothing yet —
     // give it zero height so it never flashes a literal "<" before completing.
-    if markdown.first == "<", !markdown.contains(">"),
+    if markdown.first == "<", !markdown.utf8.contains(0x3E),
       markdown.dropFirst().allSatisfy({ $0.isLetter || $0 == "/" })
     {
       return true
@@ -284,6 +286,7 @@ enum InlineMarkdown {
     }
     let n = chars.count
     var text: [Character] = []
+    text.reserveCapacity(min(n, 64))
     var i = 0
 
     func flushText() {
@@ -299,7 +302,7 @@ enum InlineMarkdown {
       // Backslash escape: ASCII punctuation renders literally.
       if c == "\\", i + 1 < n {
         let next = chars[i + 1]
-        if next.isASCII, next.isPunctuation || next.isSymbol {
+        if next.isASCII, isPunctuationOrSymbol(next) {
           text.append(next)
         } else {
           text.append(c)
@@ -518,16 +521,33 @@ enum InlineMarkdown {
   /// cmark left-/right-flanking rules. Out-of-range neighbors count as
   /// whitespace (start/end of block behaves like a space).
   private static func flankingProperties(prev: Character?, next: Character?) -> Flanking {
-    func isWS(_ c: Character?) -> Bool { c.map(\.isWhitespace) ?? true }
+    func isWS(_ c: Character?) -> Bool { c.map(isWhitespace) ?? true }
     func isPunct(_ c: Character?) -> Bool {
       guard let c else { return false }
-      return c.isPunctuation || c.isSymbol
+      return isPunctuationOrSymbol(c)
     }
     let prevWS = isWS(prev), nextWS = isWS(next)
     let prevPunct = isPunct(prev), nextPunct = isPunct(next)
     let left = !nextWS && (!nextPunct || prevWS || prevPunct)
     let right = !prevWS && (!prevPunct || nextWS || nextPunct)
     return Flanking(left: left, right: right, prevPunct: prevPunct, nextPunct: nextPunct)
+  }
+
+  @inline(__always)
+  private static func isWhitespace(_ character: Character) -> Bool {
+    guard let ascii = character.asciiValue else { return character.isWhitespace }
+    return ascii == 0x20 || (ascii >= 0x09 && ascii <= 0x0D)
+  }
+
+  @inline(__always)
+  private static func isPunctuationOrSymbol(_ character: Character) -> Bool {
+    guard let ascii = character.asciiValue else {
+      return character.isPunctuation || character.isSymbol
+    }
+    return (ascii >= 0x21 && ascii <= 0x2F)
+      || (ascii >= 0x3A && ascii <= 0x40)
+      || (ascii >= 0x5B && ascii <= 0x60)
+      || (ascii >= 0x7B && ascii <= 0x7E)
   }
 
   // MARK: - Inline HTML scanning
@@ -618,7 +638,7 @@ enum InlineMarkdown {
   /// last so `&amp;lt;` round-trips to `&lt;`. CommonMark decodes entities in
   /// text too, so this also nudges plain markdown toward the oracle.
   static func decodeEntities(_ s: String) -> String {
-    guard s.contains("&") else { return s }
+    guard s.utf8.contains(0x26) else { return s }
     var out = s
     out = out.replacingOccurrences(of: "&lt;", with: "<")
     out = out.replacingOccurrences(of: "&gt;", with: ">")
@@ -638,6 +658,7 @@ enum InlineMarkdown {
     tokens: [Token], delims: inout [Delim], isTail: Bool
   ) -> [Span] {
     var spans: [Span] = []
+    spans.reserveCapacity(min(delims.count / 2, 16))
 
     var ci = 0
     while ci < delims.count {
@@ -768,6 +789,7 @@ enum InlineMarkdown {
 
   private static func emit(tokens: [Token], delims: [Delim], spans: [Span]) -> [TraitRun] {
     var runs: [TraitRun] = []
+    runs.reserveCapacity(min(tokens.count, 32))
     var linkDepth = 0
     var linkDestination: String?
     let hasSpans = !spans.isEmpty

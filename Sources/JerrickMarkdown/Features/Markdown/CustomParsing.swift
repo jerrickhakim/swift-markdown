@@ -14,7 +14,7 @@ public struct MarkdownListItemData: Equatable, Sendable {
     /// text may still be growing. Only an open item gets the streaming word
     /// holdback; a closed item's text is final (more source lines follow it),
     /// so holding its last word back would hide it forever.
-    public var open: Bool
+    public var open: Bool = false
 
     public init(depth: Int, ordered: Bool, index: Int, text: String, open: Bool = false) {
         self.depth = depth
@@ -115,8 +115,6 @@ public final class StableBlock: Identifiable {
 public final class StableMarkdownParser {
     public private(set) var blocks: [StableBlock] = []
 
-    public init() {}
-
     /// Number of blocks whose content is finalized (won't change with more text).
     private var stableCount = 0
     /// UTF-8 byte offset in the source where the stable prefix ends — the start
@@ -125,6 +123,19 @@ public final class StableMarkdownParser {
     /// The previous markdown string, used for the no-change fast path and the
     /// stable-prefix comparison.
     private var previousMarkdown = ""
+    /// A known one-line prose tail cannot change block grammar until a newline.
+    private var appendingPlainParagraph = false
+    /// The tail is one list whose items map 1:1 onto `tailLines`. Until a newline
+    /// arrives only its final item can change, so the flush re-parses that one
+    /// line instead of every item in the run.
+    private var appendingListItems = false
+    /// The mutable tail's source lines, carried across updates. Splitting the
+    /// tail was ~35% of a streamed list's parse time because a growing block
+    /// re-split every line it already held on every flush; an append extends
+    /// these in place instead, and sealing a block drops the lines it consumed.
+    private var tailLines: [String] = []
+    /// Whether `tailLines` still describes `previousMarkdown[stableUTF8Offset...]`.
+    private var tailLinesValid = false
 
     /// Re-parse only the trailing portion of the markdown string.
     ///
@@ -134,47 +145,135 @@ public final class StableMarkdownParser {
     /// FULL accumulated markdown on every streamed flush — quadratic over a long
     /// response. The stable offset is now byte-based and advanced from the tail
     /// parse alone.
+    public init() {}
+
     public func update(markdown: String) {
+        update(markdown: markdown, isKnownAppend: false)
+    }
+
+    /// Chat text deltas only ever append to a part. That caller can skip the
+    /// settled-prefix byte comparison; generic document/editor callers keep the
+    /// defensive `update(markdown:)` path because their source may change anywhere.
+    func updateAppending(markdown: String) {
+        update(markdown: markdown, isKnownAppend: true)
+    }
+
+    private func update(markdown: String, isKnownAppend: Bool) {
         // Fast path: if nothing changed, skip entirely
         if markdown == previousMarkdown { return }
 
-        if stableCount > 0, hasUnchangedStablePrefix(markdown) {
-            // The stable prefix is still valid — only re-parse the tail. Edits
-            // AFTER the stable offset (not just appends) are covered too, since
-            // the whole tail is re-parsed and reconciled.
-            let utf8 = markdown.utf8
-            let tailStart = utf8.index(utf8.startIndex, offsetBy: stableUTF8Offset)
-            let tail = String(markdown[tailStart...])
-            let tailBlocks = MarkdownParser.parse(tail)
-
-            // stableUTF8Offset points to the start of block[stableCount] (the trailing
-            // block), so tailBlocks[0] corresponds to that block. Reconcile from there —
-            // not from stableCount - 1, which would clobber the last stable block.
-            reconcileTail(tailBlocks, from: stableCount)
-
-            // All blocks except the mutable tail are now "done". Advance the
-            // stable offset by where the new trailing region starts WITHIN the
-            // tail — no full-string re-scan.
-            let newStable = stableBlockCount()
-            if newStable > stableCount, !tailBlocks.isEmpty {
-                stableUTF8Offset += Self.sourceUTF8Offset(
-                    forBlocks: newStable - stableCount, in: tail)
-                stableCount = newStable
+        // A changed String of the same/shorter length cannot be an append; fall
+        // back to validation even if a caller accidentally uses the fast API.
+        let utf8 = markdown.utf8
+        let previousUTF8Count = previousMarkdown.utf8.count
+        let grew = utf8.count > previousUTF8Count
+        if isKnownAppend, grew, appendingPlainParagraph || appendingListItems,
+           blocks.count == stableCount + 1 {
+            let appendedStart = utf8.index(utf8.startIndex, offsetBy: previousUTF8Count)
+            if appendingListItems,
+               !MarkdownParser.containsByte(utf8[appendedStart...], 0x0A),
+               appendLastListItem(markdown: markdown, appended: utf8[appendedStart...]) {
+                previousMarkdown = markdown
+                return
             }
-        } else {
-            // Stable prefix changed (replace/edit) or no stable prefix yet — full re-parse.
+            if appendingPlainParagraph,
+               !MarkdownParser.containsByte(utf8[appendedStart...], 0x0A) {
+                let tailStart = utf8.index(utf8.startIndex, offsetBy: stableUTF8Offset)
+                let tail = String(markdown[tailStart...])
+                let text = tail.last.map(MarkdownParser.isTrimmableWhitespace) == true
+                    ? tail.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : tail
+                let content = MarkdownBlockContent.paragraph(
+                    text: text, alignment: .leading)
+                if blocks[stableCount].content != content {
+                    blocks[stableCount].setContent(content)
+                }
+                // This path owns the tail too — the appended bytes carry no
+                // newline, so the cache stays a single line.
+                if tailLinesValid {
+                    if tailLines.count == 1 { tailLines[0] = tail } else { tailLinesValid = false }
+                }
+                previousMarkdown = markdown
+                return
+            }
+        }
+        appendingPlainParagraph = false
+        appendingListItems = false
+
+        // The stable prefix is valid when the settled bytes are untouched — then
+        // only the tail re-parses. Edits AFTER the stable offset (not just
+        // appends) are covered too, since the whole tail is re-parsed and
+        // reconciled. Otherwise the tail is the whole document: a response that
+        // is still ONE block has no stable prefix, which is the common streaming
+        // shape, so both cases run the same cached-line path from offset zero.
+        let isAppend = isKnownAppend && grew
+        let prefixValid = stableCount > 0 && (isAppend || hasUnchangedStablePrefix(markdown))
+        if !prefixValid {
+            if stableUTF8Offset != 0 { tailLinesValid = false }
             stableCount = 0
             stableUTF8Offset = 0
-            let newContents = MarkdownParser.parse(markdown)
-            reconcileFull(newContents)
+        }
 
-            stableCount = stableBlockCount()
-            if stableCount > 0 {
-                stableUTF8Offset = Self.sourceUTF8Offset(forBlocks: stableCount, in: markdown)
+        refreshTailLines(
+            markdown: markdown, isAppend: isAppend, previousUTF8Count: previousUTF8Count)
+        let tailBlocks = MarkdownParser.parse(lines: tailLines)
+
+        // stableUTF8Offset points to the start of block[stableCount] (the trailing
+        // block), so tailBlocks[0] corresponds to that block. Reconcile from there —
+        // not from stableCount - 1, which would clobber the last stable block.
+        reconcileTail(tailBlocks, from: stableCount)
+
+        // All blocks except the mutable tail are now "done". Advance the stable
+        // offset by where the new trailing region starts WITHIN the tail — no
+        // full-string re-scan — and drop the lines it consumed from the cache.
+        let newStable = stableBlockCount()
+        if newStable > stableCount, !tailBlocks.isEmpty {
+            let sealed = Self.sourceLineCount(forBlocks: newStable - stableCount, in: tailLines)
+            for index in 0..<sealed {
+                stableUTF8Offset += tailLines[index].utf8.count + 1
             }
+            tailLines.removeFirst(sealed)
+            stableUTF8Offset = min(stableUTF8Offset, utf8.count)
+            stableCount = newStable
+        }
+        appendingPlainParagraph = tailBlocks.count == 1 && tailLines.count == 1
+            && MarkdownParser.plainSingleLineParagraphText(tailLines[0]) != nil
+        if tailBlocks.count == 1, case .list(let items) = tailBlocks[0] {
+            // A 1:1 item-to-line count means the run holds no blank lines, so
+            // the last line is unambiguously the last item.
+            appendingListItems = items.count == tailLines.count
         }
 
         previousMarkdown = markdown
+    }
+
+    /// Folds bytes appended to the tail's final line back into the trailing list
+    /// item, leaving every earlier item untouched. Returns false when the new
+    /// line no longer reads as a plain item — a marker turning into a thematic
+    /// break, say — and the caller must re-parse the whole run.
+    private func appendLastListItem(markdown: String, appended: String.UTF8View.SubSequence) -> Bool {
+        guard tailLinesValid, !tailLines.isEmpty,
+              case .list(var items) = blocks[stableCount].content,
+              items.count == tailLines.count
+        else { return false }
+
+        let line = tailLines[tailLines.count - 1] + String(decoding: appended, as: UTF8.self)
+        guard var item = MarkdownParser.parseListItemLine(line) else { return false }
+        if !item.ordered, MarkdownParser.startsWithThematicBreakMarker(item.text),
+           MarkdownParser.isThematicBreak(line) {
+            return false
+        }
+        // The run still ends at the source's end, so its final item stays open.
+        item.open = true
+
+        tailLines[tailLines.count - 1] = line
+        // Only the final item can differ, so compare that one rather than
+        // walking the whole list to discover what we already know.
+        if item != items[items.count - 1] {
+            items[items.count - 1] = item
+            blocks[stableCount].setContent(.list(items: items))
+        }
+        return true
     }
 
     /// How many leading blocks are finalized. Normally all but the last — but a
@@ -196,13 +295,9 @@ public final class StableMarkdownParser {
     /// is valid. Byte-compares just the stable region instead of running
     /// `hasPrefix(previousMarkdown)` over the whole previous string.
     ///
-    /// PERF: this runs on EVERY streaming delta and its cost scales with the
-    /// settled prefix, so a naive element-by-element compare made the live path
-    /// O(n²) over a turn (each token re-walks the whole settled text). Comparing
-    /// the contiguous UTF-8 buffers with `memcmp` is the same comparison ~10×
-    /// cheaper, which cut streaming a 32KB reply ~3×. (Still O(stable) per delta;
-    /// a truly O(tail) version would require the parser to own the accumulated
-    /// text — a larger change. See the streaming scaling notes.)
+    /// PERF: generic document updates pay this cost when they have a stable
+    /// prefix; chat's known-append path bypasses it. Comparing contiguous UTF-8
+    /// buffers keeps the defensive path much cheaper than grapheme iteration.
     private func hasUnchangedStablePrefix(_ markdown: String) -> Bool {
         let a = markdown.utf8
         let b = previousMarkdown.utf8
@@ -219,62 +314,46 @@ public final class StableMarkdownParser {
         return a.prefix(stableUTF8Offset).elementsEqual(b.prefix(stableUTF8Offset))
     }
 
-    /// UTF-8 byte offset in `markdown` where block `blockCount` begins (the offset
-    /// after the first `blockCount` blocks, skipping trailing blank lines). Cost is
-    /// O(`markdown`) — the streaming path passes the tail, never the full text.
-    private static func sourceUTF8Offset(forBlocks blockCount: Int, in markdown: String) -> Int {
-        // Re-parse to find where block N ends. This is cheap since we only
-        // parse up to blockCount blocks (usually all but the last).
-        let lines = markdown.components(separatedBy: "\n")
+    /// Refreshes `tailLines` to describe `markdown[stableUTF8Offset...]`. A pure
+    /// append over a still-valid cache only splits the appended bytes: they
+    /// extend the final (incomplete) line and add whatever newlines they carry.
+    private func refreshTailLines(markdown: String, isAppend: Bool, previousUTF8Count: Int) {
+        let utf8 = markdown.utf8
+        if isAppend, tailLinesValid, !tailLines.isEmpty, previousUTF8Count >= stableUTF8Offset {
+            let appended = utf8.index(utf8.startIndex, offsetBy: previousUTF8Count)
+            var isFirstSegment = true
+            MarkdownParser.forEachASCIIField(utf8[appended...], separator: 0x0A) { segment in
+                if isFirstSegment {
+                    tailLines[tailLines.count - 1] += segment
+                    isFirstSegment = false
+                } else {
+                    tailLines.append(segment)
+                }
+            }
+            return
+        }
+        let tailStart = utf8.index(utf8.startIndex, offsetBy: stableUTF8Offset)
+        tailLines = MarkdownParser.splitASCII(String(markdown[tailStart...]), separator: 0x0A)
+        tailLinesValid = true
+    }
+
+    /// Index of the line where block `blockCount` begins (past the first
+    /// `blockCount` blocks and any blank lines that follow them).
+    private static func sourceLineCount(forBlocks blockCount: Int, in lines: [String]) -> Int {
         var index = 0
         var blocksFound = 0
 
         while index < lines.count && blocksFound < blockCount {
-            let line = lines[index]
-
-            if let codeResult = MarkdownParser.parseFencedCodeBlock(lines: lines, startIndex: index) {
-                _ = codeResult
-                index = codeResult.nextIndex
-            } else if let mathResult = MarkdownParser.parseMathBlock(lines: lines, startIndex: index) {
-                index = mathResult.nextIndex
-            } else if let htmlResult = MarkdownParser.parseHTMLBlock(lines: lines, startIndex: index) {
-                index = htmlResult.nextIndex
-                // A skipped HTML block (e.g. an image) advances the cursor but
-                // produces NO block — don't count it, or the block tally drifts
-                // from what `parse()` actually emitted and the byte offset skews.
-                if htmlResult.block == nil { continue }
-            } else if MarkdownParser.isThematicBreak(line) {
-                index += 1
-            } else if MarkdownParser.parseHeading(line) != nil {
-                index += 1
-            } else if let tableResult = MarkdownParser.parseTable(lines: lines, startIndex: index) {
-                index = tableResult.nextIndex
-            } else if line.trimmingCharacters(in: .whitespaces).hasPrefix(">") {
-                let bqResult = MarkdownParser.parseBlockQuote(lines: lines, startIndex: index)
-                index = bqResult.nextIndex
-            } else if let listResult = MarkdownParser.parseList(lines: lines, startIndex: index) {
-                index = listResult.nextIndex
-            } else if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                index += 1
-                continue // blank lines don't count as blocks
-            } else {
-                let paraResult = MarkdownParser.parseParagraph(lines: lines, startIndex: index)
-                index = paraResult.nextIndex
-            }
-            blocksFound += 1
+            let result = MarkdownParser.parseNextBlock(lines: lines, startIndex: index)
+            index = max(result.nextIndex, index + 1)
+            if result.block != nil { blocksFound += 1 }
         }
 
         // Skip any trailing blank lines so the offset starts clean
-        while index < lines.count && lines[index].trimmingCharacters(in: .whitespaces).isEmpty {
+        while index < lines.count && MarkdownParser.isHorizontalWhitespaceOnly(lines[index]) {
             index += 1
         }
-
-        // Convert line index back to a UTF-8 byte offset
-        var byteOffset = 0
-        for i in 0..<min(index, lines.count) {
-            byteOffset += lines[i].utf8.count + 1 // +1 for the "\n" separator
-        }
-        return min(byteOffset, markdown.utf8.count)
+        return min(index, lines.count)
     }
 
     /// Full reconcile — used when text was replaced, not appended.
@@ -322,92 +401,263 @@ public final class StableMarkdownParser {
 
 struct MarkdownParser {
 
+    struct SourceParseResult {
+        /// nil for source that is intentionally consumed without rendering
+        /// (blank lines and skipped HTML media).
+        let block: MarkdownBlockContent?
+        let nextIndex: Int
+    }
+
+    /// ASCII separators cannot occur inside a multi-byte UTF-8 scalar. Splitting
+    /// the byte view preserves empty fields while avoiding Foundation's
+    /// normalization-aware substring search.
+    static func splitASCII(_ source: String, separator: UInt8) -> [String] {
+        let bytes = source.utf8
+        if let fields = bytes.withContiguousStorageIfAvailable({ buffer in
+            var result: [String] = []
+            // Most incremental tails are short; cover them in one allocation
+            // without sizing a large array from an unusually long source line.
+            result.reserveCapacity(min(32, buffer.count + 1))
+            var fieldStart = buffer.startIndex
+            var index = fieldStart
+            while index < buffer.endIndex {
+                if buffer[index] == separator {
+                    result.append(String(decoding: buffer[fieldStart..<index], as: UTF8.self))
+                    fieldStart = index + 1
+                }
+                index += 1
+            }
+            result.append(String(decoding: buffer[fieldStart..<buffer.endIndex], as: UTF8.self))
+            return result
+        }) {
+            return fields
+        }
+        return bytes.split(separator: separator, omittingEmptySubsequences: false).map {
+            String(decoding: $0, as: UTF8.self)
+        }
+    }
+
+    /// `splitASCII` over a UTF-8 slice, yielding each field without building the
+    /// slice's own String first. The streaming parser splits only its appended
+    /// bytes this way, so a flush allocates per new line instead of per tail.
+    static func forEachASCIIField(
+        _ bytes: String.UTF8View.SubSequence, separator: UInt8, _ body: (String) -> Void
+    ) {
+        let handled: Void? = bytes.withContiguousStorageIfAvailable { buffer in
+            var fieldStart = 0
+            for index in 0..<buffer.count where buffer[index] == separator {
+                body(String(decoding: buffer[fieldStart..<index], as: UTF8.self))
+                fieldStart = index + 1
+            }
+            body(String(decoding: buffer[fieldStart...], as: UTF8.self))
+        }
+        if handled != nil { return }
+        for field in bytes.split(separator: separator, omittingEmptySubsequences: false) {
+            body(String(decoding: field, as: UTF8.self))
+        }
+    }
+
+    @inline(__always)
+    static func containsByte<Bytes: Collection>(_ bytes: Bytes, _ byte: UInt8) -> Bool
+    where Bytes.Element == UInt8 {
+        if bytes.isEmpty { return false }
+        if let result = bytes.withContiguousStorageIfAvailable({ buffer in
+            memchr(buffer.baseAddress!, Int32(byte), buffer.count) != nil
+        }) {
+            return result
+        }
+        return bytes.contains(byte)
+    }
+
+    @inline(__always)
+    static func isASCIIWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || (byte >= 0x09 && byte <= 0x0D)
+    }
+
+    @inline(__always)
+    static func isHorizontalWhitespace(_ scalar: UnicodeScalar) -> Bool {
+        scalar.value == 0x09 || scalar.value == 0x20
+            || (scalar.value >= 0x80 && CharacterSet.whitespaces.contains(scalar))
+    }
+
+    /// Byte-level trim for the overwhelmingly common all-ASCII line. Returns nil
+    /// when any byte is non-ASCII, where Unicode whitespace classification (and
+    /// scalar boundaries) must decide instead.
+    @inline(__always)
+    private static func trimmingASCIIHorizontalWhitespace(_ source: String) -> String?? {
+        source.utf8.withContiguousStorageIfAvailable { buffer -> String? in
+            var start = 0
+            var end = buffer.count
+            while start < end {
+                let byte = buffer[start]
+                if byte >= 0x80 { return nil }
+                guard byte == 0x20 || byte == 0x09 else { break }
+                start += 1
+            }
+            while end > start {
+                let byte = buffer[end - 1]
+                if byte >= 0x80 { return nil }
+                guard byte == 0x20 || byte == 0x09 else { break }
+                end -= 1
+            }
+            if start == 0 && end == buffer.count { return source }
+            return String(decoding: buffer[start..<end], as: UTF8.self)
+        }
+    }
+
+    static func trimmingHorizontalWhitespace(_ source: String) -> String {
+        if let contiguous = trimmingASCIIHorizontalWhitespace(source), let trimmed = contiguous {
+            return trimmed
+        }
+        let scalars = source.unicodeScalars
+        var start = scalars.startIndex
+        var end = scalars.endIndex
+        while start < end, isHorizontalWhitespace(scalars[start]) {
+            start = scalars.index(after: start)
+        }
+        while end > start {
+            let previous = scalars.index(before: end)
+            guard isHorizontalWhitespace(scalars[previous]) else { break }
+            end = previous
+        }
+        guard start != scalars.startIndex || end != scalars.endIndex else { return source }
+        return String(scalars[start..<end])
+    }
+
+    static func isHorizontalWhitespaceOnly(_ source: String) -> Bool {
+        let ascii = source.utf8.withContiguousStorageIfAvailable { buffer -> Bool? in
+            for byte in buffer {
+                if byte >= 0x80 { return nil }
+                if byte != 0x20 && byte != 0x09 { return false }
+            }
+            return true
+        }
+        if let contiguous = ascii, let result = contiguous { return result }
+        return source.unicodeScalars.allSatisfy(isHorizontalWhitespace)
+    }
+
+    @inline(__always)
+    static func isTrimmableWhitespace(_ character: Character) -> Bool {
+        // CharacterSet.whitespacesAndNewlines additionally contains U+200B on
+        // Apple platforms; keep boundary fast paths identical to Foundation.
+        character.isWhitespace || character == "\u{200B}"
+    }
+
+    /// Returns the first non-whitespace ASCII byte, `-1` for an empty/blank
+    /// ASCII line, or `-2` when Unicode classification is required.
+    @inline(__always)
+    static func leadingASCIIByte(_ source: String) -> Int {
+        for byte in source.utf8 {
+            if isASCIIWhitespace(byte) { continue }
+            return byte < 0x80 ? Int(byte) : -2
+        }
+        return -1
+    }
+
     /// Parse a raw markdown string into an array of block contents.
     static func parse(_ markdown: String) -> [MarkdownBlockContent] {
+        // Most streamed prose starts as one ordinary line. In that case the
+        // block parse is already determined, and the paragraph parser would
+        // only split, probe, join, and trim the same String. Reuse its storage
+        // directly; marker-led or leading-whitespace lines keep the full path.
+        if let text = plainSingleLineParagraphText(markdown) {
+            return [.paragraph(text: text, alignment: .leading)]
+        }
+
+        return parse(lines: splitASCII(markdown, separator: 0x0A))
+    }
+
+    /// Parse pre-split source lines. The streaming parser keeps its tail's lines
+    /// across updates and enters here, so an append does not re-split — and
+    /// re-allocate — every line of the block it is still growing.
+    static func parse(lines: [String]) -> [MarkdownBlockContent] {
         var blocks: [MarkdownBlockContent] = []
-        let lines = markdown.components(separatedBy: "\n")
+        blocks.reserveCapacity(min(lines.count, 32))
         var index = 0
 
         while index < lines.count {
-            let line = lines[index]
-
-            // --- Fenced code block (``` or ~~~) ---
-            if let codeResult = parseFencedCodeBlock(lines: lines, startIndex: index) {
-                blocks.append(codeResult.block)
-                index = codeResult.nextIndex
-                continue
-            }
-
-            // --- Math block ($$ … $$) ---
-            if let mathResult = parseMathBlock(lines: lines, startIndex: index) {
-                blocks.append(mathResult.block)
-                index = mathResult.nextIndex
-                continue
-            }
-
-            // --- HTML block (<details>, <table>, <pre>, <blockquote>, <p>,
-            //     <h1>–<h6>, <img>, <picture>). Inline-only tags (<kbd>, <sup>,
-            //     …) are NOT block tags, so a line that opens with one falls
-            //     through to the paragraph path and renders via inline HTML. ---
-            if let htmlResult = parseHTMLBlock(lines: lines, startIndex: index) {
-                if let block = htmlResult.block { blocks.append(block) }
-                index = htmlResult.nextIndex
-                continue
-            }
-
-            // --- Thematic break (---, ***, ___) ---
-            if isThematicBreak(line) {
-                blocks.append(.thematicBreak)
-                index += 1
-                continue
-            }
-
-            // --- Heading (# … ######) ---
-            if let heading = parseHeading(line) {
-                blocks.append(heading)
-                index += 1
-                continue
-            }
-
-            // --- Table ---
-            if let tableResult = parseTable(lines: lines, startIndex: index) {
-                blocks.append(tableResult.block)
-                index = tableResult.nextIndex
-                continue
-            }
-
-            // --- Block quote (>) ---
-            if line.trimmingCharacters(in: .whitespaces).hasPrefix(">") {
-                let bqResult = parseBlockQuote(lines: lines, startIndex: index)
-                blocks.append(bqResult.block)
-                index = bqResult.nextIndex
-                continue
-            }
-
-            // --- List (run of -, *, +, 1. lines → ONE block) ---
-            if let listResult = parseList(lines: lines, startIndex: index) {
-                blocks.append(listResult.block)
-                index = listResult.nextIndex
-                continue
-            }
-
-            // --- Blank line (skip) ---
-            if line.trimmingCharacters(in: .whitespaces).isEmpty {
-                index += 1
-                continue
-            }
-
-            // --- Paragraph (default) ---
-            let paraResult = parseParagraph(lines: lines, startIndex: index)
-            blocks.append(paraResult.block)
-            // Defensive: parseParagraph always consumes ≥1 line, but never let a
-            // non-advancing parse result spin this loop forever. A stalled parse
-            // freezes the main thread, which on iOS reads as the app hanging and
-            // then being watchdog-killed (a "crash"). `max` guarantees progress.
-            index = max(paraResult.nextIndex, index + 1)
+            let result = parseNextBlock(lines: lines, startIndex: index)
+            if let block = result.block { blocks.append(block) }
+            // Every parser is expected to advance, but keep this outer guard so a
+            // malformed future parser cannot spin the main thread forever.
+            index = max(result.nextIndex, index + 1)
         }
 
         return blocks
+    }
+
+    static func plainSingleLineParagraphText(_ markdown: String) -> String? {
+        guard !containsByte(markdown.utf8, 0x0A),
+              let first = markdown.first,
+              let last = markdown.last,
+              !isTrimmableWhitespace(first),
+              first != "`", first != "~", first != "$", first != "<",
+              first != "-", first != "*", first != "_", first != "#",
+              first != ">", first != "+", !first.isNumber else {
+            return nil
+        }
+        return isTrimmableWhitespace(last)
+            ? markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+            : markdown
+    }
+
+    /// Parses one source block. The first non-whitespace character cheaply gates
+    /// syntax-specific parsers, so ordinary prose does not repeatedly trim and
+    /// inspect the full line for fences, math, HTML, rules, headings, quotes, and
+    /// lists before reaching the paragraph path. Long streaming paragraphs are
+    /// the hot case, and each avoided probe otherwise walks their entire tail.
+    static func parseNextBlock(lines: [String], startIndex: Int) -> SourceParseResult {
+        let line = lines[startIndex]
+        // ASCII covers markdown's syntax markers and the overwhelmingly common
+        // source path. Unicode-leading lines retain Character classification.
+        let leadingByte = leadingASCIIByte(line)
+        let unicodeFirst = leadingByte == -2
+            ? line.first(where: { !$0.isWhitespace })
+            : nil
+
+        if leadingByte == 0x60 || leadingByte == 0x7E
+            || unicodeFirst == "`" || unicodeFirst == "~",
+           let result = parseFencedCodeBlock(lines: lines, startIndex: startIndex) {
+            return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
+        }
+        if leadingByte == 0x24 || unicodeFirst == "$",
+           let result = parseMathBlock(lines: lines, startIndex: startIndex) {
+            return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
+        }
+        if leadingByte == 0x3C || unicodeFirst == "<",
+           let result = parseHTMLBlock(lines: lines, startIndex: startIndex) {
+            return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
+        }
+        if leadingByte == 0x2D || leadingByte == 0x2A || leadingByte == 0x5F
+            || unicodeFirst == "-" || unicodeFirst == "*" || unicodeFirst == "_",
+           isThematicBreak(line) {
+            return SourceParseResult(block: .thematicBreak, nextIndex: startIndex + 1)
+        }
+        if leadingByte == 0x23 || unicodeFirst == "#", let heading = parseHeading(line) {
+            return SourceParseResult(block: heading, nextIndex: startIndex + 1)
+        }
+        if startIndex + 1 < lines.count,
+           isTableDelimiterRow(lines[startIndex + 1]),
+           let result = parseTable(lines: lines, startIndex: startIndex) {
+            return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
+        }
+        if leadingByte == 0x3E || unicodeFirst == ">" {
+            let result = parseBlockQuote(lines: lines, startIndex: startIndex)
+            return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
+        }
+        let startsASCIINumber = leadingByte >= 0x30 && leadingByte <= 0x39
+        if leadingByte == 0x2D || leadingByte == 0x2A || leadingByte == 0x2B
+            || unicodeFirst == "-" || unicodeFirst == "*" || unicodeFirst == "+"
+            || startsASCIINumber || unicodeFirst?.isNumber == true,
+           let result = parseList(lines: lines, startIndex: startIndex) {
+            return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
+        }
+        if leadingByte == -1 || (leadingByte == -2 && unicodeFirst == nil) {
+            return SourceParseResult(block: nil, nextIndex: startIndex + 1)
+        }
+
+        let result = parseParagraph(lines: lines, startIndex: startIndex)
+        return SourceParseResult(block: result.block, nextIndex: result.nextIndex)
     }
 }
 
@@ -436,19 +686,45 @@ extension MarkdownParser {
         let afterFence = String(trimmed.dropFirst(fence.count)).trimmingCharacters(in: .whitespaces)
         let language = afterFence.isEmpty ? nil : afterFence
 
-        var codeLines: [String] = []
+        // A streaming fence re-parses its whole body on every flush, so the
+        // closing-fence probe runs per line per update. Byte-scanning it, and
+        // appending into the code string directly, keeps that probe allocation
+        // free instead of trimming a fresh String for every body line.
+        let fenceByte = trimmed.utf8.first ?? 0x60
+        var code = ""
         var i = startIndex + 1
         while i < lines.count {
-            if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix(fence) {
+            if hasFencePrefix(lines[i], fenceByte) {
                 i += 1
                 break
             }
-            codeLines.append(lines[i])
+            if i > startIndex + 1 { code.append("\n") }
+            code += lines[i]
             i += 1
         }
 
-        let code = codeLines.joined(separator: "\n")
         return ParseResult(block: .codeBlock(language: language, code: code), nextIndex: i)
+    }
+
+    /// True when `line`, ignoring leading whitespace, opens with three `marker`
+    /// bytes — the closing-fence test, without the trimmed copy it used to make.
+    @inline(__always)
+    private static func hasFencePrefix(_ line: String, _ marker: UInt8) -> Bool {
+        let ascii = line.utf8.withContiguousStorageIfAvailable { buffer -> Bool? in
+            var index = 0
+            while index < buffer.count {
+                let byte = buffer[index]
+                if byte >= 0x80 { return nil }
+                guard byte == 0x20 || byte == 0x09 else { break }
+                index += 1
+            }
+            guard index + 3 <= buffer.count else { return false }
+            return buffer[index] == marker && buffer[index + 1] == marker
+                && buffer[index + 2] == marker
+        }
+        if let contiguous = ascii, let result = contiguous { return result }
+        let fence = marker == 0x7E ? "~~~" : "```"
+        return line.trimmingCharacters(in: .whitespaces).hasPrefix(fence)
     }
 
     // MARK: Math Block
@@ -483,6 +759,7 @@ extension MarkdownParser {
         guard trimmed == "$$" else { return nil }
 
         var body: [String] = []
+        body.reserveCapacity(min(max(0, lines.count - startIndex - 1), 16))
         var i = startIndex + 1
         var closed = false
         while i < lines.count {
@@ -509,7 +786,61 @@ extension MarkdownParser {
 
     // MARK: Heading
 
+    private enum HeadingScan {
+        case notHeading
+        case heading(level: Int, text: String)
+        /// Unicode whitespace sits on a boundary; Foundation has to trim it.
+        case needsUnicode
+    }
+
+    /// One byte pass over an ASCII heading line. The general path allocates
+    /// three strings — trim, drop the markers, trim again — and a streaming
+    /// heading pays them on every flush until its line ends.
+    private static func scanASCIIHeading(_ line: String) -> HeadingScan {
+        line.utf8.withContiguousStorageIfAvailable { buffer -> HeadingScan in
+            @inline(__always) func isSpace(_ byte: UInt8) -> Bool { byte == 0x20 || byte == 0x09 }
+            var start = 0
+            var end = buffer.count
+            while start < end {
+                if buffer[start] >= 0x80 { return .needsUnicode }
+                guard isSpace(buffer[start]) else { break }
+                start += 1
+            }
+            while end > start {
+                if buffer[end - 1] >= 0x80 { return .needsUnicode }
+                guard isSpace(buffer[end - 1]) else { break }
+                end -= 1
+            }
+
+            var level = 0
+            var index = start
+            while index < end, buffer[index] == 0x23 {
+                level += 1
+                index += 1
+            }
+            guard level >= 1, level <= 6 else { return .notHeading }
+            // A tab after the markers is not a heading — matching `rest.first`.
+            if index < end, buffer[index] != 0x20 { return .notHeading }
+            while index < end {
+                if buffer[index] >= 0x80 { return .needsUnicode }
+                guard isSpace(buffer[index]) else { break }
+                index += 1
+            }
+            return .heading(
+                level: level, text: String(decoding: buffer[index..<end], as: UTF8.self))
+        } ?? .needsUnicode
+    }
+
     static func parseHeading(_ line: String) -> MarkdownBlockContent? {
+        switch scanASCIIHeading(line) {
+        case .notHeading:
+            return nil
+        case .heading(let level, let text):
+            return .heading(level: level, text: text, alignment: .leading)
+        case .needsUnicode:
+            break
+        }
+
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         var level = 0
         for char in trimmed {
@@ -525,35 +856,49 @@ extension MarkdownParser {
     // MARK: Thematic Break
 
     static func isThematicBreak(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        guard trimmed.count >= 3 else { return false }
-        let chars = Set(trimmed.filter { $0 != " " })
-        return chars.count == 1 && (chars.contains("-") || chars.contains("*") || chars.contains("_"))
+        let trimmed = trimmingHorizontalWhitespace(line)
+        guard let marker = trimmed.utf8.first,
+              marker == 0x2D || marker == 0x2A || marker == 0x5F else {
+            return false
+        }
+        var count = 0
+        for byte in trimmed.utf8 {
+            count += 1
+            if byte != 0x20, byte != marker { return false }
+        }
+        return count >= 3
     }
 
     // MARK: Block Quote
 
     static func parseBlockQuote(lines: [String], startIndex: Int) -> ParseResult {
-        var quoteLines: [String] = []
+        // Appends straight into the joined text: a streaming quote re-parses its
+        // whole run on every flush, so the per-line array and `joined` it used to
+        // build were the dominant allocation.
+        var text = ""
+        var hasQuotedLine = false
         var i = startIndex
         while i < lines.count {
-            let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix(">") {
-                let content = String(trimmed.dropFirst(1))
-                quoteLines.append(content.hasPrefix(" ") ? String(content.dropFirst(1)) : content)
-            } else if trimmed.isEmpty, !quoteLines.isEmpty {
-                if i + 1 < lines.count, lines[i + 1].trimmingCharacters(in: .whitespaces).hasPrefix(">") {
-                    quoteLines.append("")
-                } else {
+            let trimmed = trimmingHorizontalWhitespace(lines[i])
+            if trimmed.utf8.first == 0x3E {
+                let content = trimmed.dropFirst(1)
+                if hasQuotedLine { text.append("\n") }
+                text += content.utf8.first == 0x20 ? content.dropFirst(1) : content
+                hasQuotedLine = true
+            } else if trimmed.isEmpty, hasQuotedLine {
+                guard i + 1 < lines.count,
+                      trimmingHorizontalWhitespace(lines[i + 1]).utf8.first == 0x3E else {
                     break
                 }
+                text.append("\n")
             } else {
                 break
             }
             i += 1
         }
-        let text = quoteLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-        return ParseResult(block: .blockQuote(text: text), nextIndex: i)
+        return ParseResult(
+            block: .blockQuote(text: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+            nextIndex: i)
     }
 
     // MARK: List
@@ -565,24 +910,33 @@ extension MarkdownParser {
     static func parseList(lines: [String], startIndex: Int) -> ParseResult? {
         guard let first = parseListItemLine(lines[startIndex]) else { return nil }
 
-        var items: [MarkdownListItemData] = [first]
+        var items: [MarkdownListItemData] = []
+        items.reserveCapacity(4)
+        items.append(first)
         var i = startIndex + 1
         while i < lines.count {
             let line = lines[i]
-            // The outer parse checks thematic breaks before lists; mirror that
-            // here so "- - -" mid-run ends the list instead of becoming an item.
-            if isThematicBreak(line) { break }
-
             if let item = parseListItemLine(line) {
+                // Only an unordered item whose text starts with another rule
+                // marker can be a thematic break such as "- - -".
+                if !item.ordered,
+                   startsWithThematicBreakMarker(item.text),
+                   isThematicBreak(line) {
+                    break
+                }
                 items.append(item)
                 i += 1
-            } else if line.trimmingCharacters(in: .whitespaces).isEmpty {
+            } else if isHorizontalWhitespaceOnly(line) {
                 var j = i + 1
-                while j < lines.count, lines[j].trimmingCharacters(in: .whitespaces).isEmpty {
+                while j < lines.count, isHorizontalWhitespaceOnly(lines[j]) {
                     j += 1
                 }
-                guard j < lines.count, !isThematicBreak(lines[j]),
-                      parseListItemLine(lines[j]) != nil else { break }
+                guard j < lines.count, let nextItem = parseListItemLine(lines[j]) else { break }
+                if !nextItem.ordered,
+                   startsWithThematicBreakMarker(nextItem.text),
+                   isThematicBreak(lines[j]) {
+                    break
+                }
                 i = j
             } else {
                 break
@@ -598,107 +952,292 @@ extension MarkdownParser {
         return ParseResult(block: .list(items: items), nextIndex: i)
     }
 
-    /// Compiled ONCE and reused for every line. These previously compiled on
-    /// each call — `range(of:options:.regularExpression)` rebuilds the matcher
-    /// every time and `NSRegularExpression(pattern:)` was constructed per call —
-    /// and because `parseListItemLine` runs on the first line of EVERY block (the
-    /// parser tests each block-start for a list marker), that per-call regex
-    /// compilation was ~90% of the entire parse cost on a streamed reply.
-    /// Caching them cut a full parse ~7× with byte-identical output. See
-    /// `MarkdownParserSafetyTests`.
-    private static let unorderedListItemRegex = try! NSRegularExpression(
-        pattern: #"^(\s*)([-*+])(\s+(.*))?$"#)
-    private static let orderedListItemRegex = try! NSRegularExpression(
-        pattern: #"^(\s*)(\d+)\.(\s+(.*))?$"#)
+    /// A GFM table delimiter row (`| --- | :-: |`). A single pass replaces two
+    /// `contains` scans, an allocated trimmed copy, and Foundation regex matching.
+    static func isTableDelimiterRow(_ line: String) -> Bool {
+        var hasPipe = false
+        var hasHyphen = false
+        for byte in line.utf8 {
+            switch byte {
+            case 0x7C: hasPipe = true
+            case 0x2D: hasHyphen = true
+            case 0x3A: continue
+            default:
+                if byte >= 0x80 { return isUnicodeTableDelimiterRow(line) }
+                if !isASCIIWhitespace(byte) { return false }
+            }
+        }
+        return hasPipe && hasHyphen
+    }
 
-    /// A GFM table delimiter row (`| --- | :-: |`) — also cached, also compiled
-    /// per call before. Used by `parseTable` and the streaming-table look-ahead
-    /// in `parseParagraph`.
-    private static let tableDelimiterRegex = try! NSRegularExpression(
-        pattern: #"^[\|\s:\-]+$"#)
+    private static func isUnicodeTableDelimiterRow(_ line: String) -> Bool {
+        var hasPipe = false
+        var hasHyphen = false
+        for character in line {
+            switch character {
+            case "|": hasPipe = true
+            case "-": hasHyphen = true
+            case ":": continue
+            default:
+                if !character.isWhitespace { return false }
+            }
+        }
+        return hasPipe && hasHyphen
+    }
 
-    /// Whole-string match against `tableDelimiterRegex` (replaces the per-call
-    /// `range(of:options:.regularExpression)`).
-    static func isTableDelimiterRow(_ s: String) -> Bool {
-        tableDelimiterRegex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+    @inline(__always)
+    static func startsWithThematicBreakMarker(_ text: String) -> Bool {
+        switch leadingASCIIByte(text) {
+        case 0x2D, 0x2A, 0x5F:
+            return true
+        case -2:
+            let first = text.first(where: { !$0.isWhitespace })
+            return first == "-" || first == "*" || first == "_"
+        default:
+            return false
+        }
     }
 
     /// Parse a single line as a list item (unordered `-`/`*`/`+` or ordered `1.`).
     static func parseListItemLine(_ line: String) -> MarkdownListItemData? {
         // Strip zero-width spaces that remend's setext handler may add. The
-        // allocating replace only runs when one is actually present (rare).
+        // first UTF-8 byte gates the scalar scan and allocating replacement.
+        let hasZeroWidthSpace = containsByte(line.utf8, 0xE2)
+            && line.unicodeScalars.contains(where: { $0.value == 0x200B })
         let cleaned =
-            line.contains("\u{200B}")
+            hasZeroWidthSpace
             ? line.replacingOccurrences(of: "\u{200B}", with: "")
             : line
 
-        let leading = cleaned.prefix(while: { $0 == " " || $0 == "\t" })
-        let depth = leading.filter({ $0 == "\t" }).count + leading.filter({ $0 == " " }).count / 2
-        let range = NSRange(cleaned.startIndex..., in: cleaned)
+        let bytes = cleaned.utf8
+        var cursor = bytes.startIndex
+        var spaces = 0
+        var tabs = 0
+        while cursor < bytes.endIndex {
+            if bytes[cursor] == 0x20 {
+                spaces += 1
+            } else if bytes[cursor] == 0x09 {
+                tabs += 1
+            } else {
+                if bytes[cursor] >= 0x80 || isASCIIWhitespace(bytes[cursor]) {
+                    return parseUnicodeListItemLine(cleaned)
+                }
+                break
+            }
+            cursor = bytes.index(after: cursor)
+        }
+        guard cursor < bytes.endIndex else { return nil }
+        let depth = tabs + spaces / 2
+        let marker = bytes[cursor]
 
         // Unordered: -, *, +
-        if Self.unorderedListItemRegex.firstMatch(in: cleaned, range: range) != nil {
-            let stripped = cleaned.trimmingCharacters(in: .whitespaces)
-            // Bare marker (e.g. "-") → empty list item
-            let text = stripped.count > 1 ? String(stripped.dropFirst(2)) : ""
+        if marker == 0x2D || marker == 0x2A || marker == 0x2B {
+            let afterMarker = bytes.index(after: cursor)
+            guard afterMarker < bytes.endIndex else {
+                return MarkdownListItemData(
+                    depth: depth, ordered: false, index: 0, text: "")
+            }
+            if bytes[afterMarker] >= 0x80 {
+                return parseUnicodeListItemLine(cleaned)
+            }
+            guard isASCIIWhitespace(bytes[afterMarker]) else { return nil }
+
+            // `trimmingCharacters(in: .whitespaces)` also removes non-ASCII
+            // whitespace at the end. Keep that uncommon case on the Unicode
+            // path instead of changing the parsed item text.
+            if bytes.last.map({ $0 >= 0x80 }) == true,
+               cleaned.unicodeScalars.last.map(CharacterSet.whitespaces.contains) == true {
+                return parseUnicodeListItemLine(cleaned)
+            }
+
+            var textEnd = bytes.endIndex
+            while textEnd > afterMarker {
+                let previous = bytes.index(before: textEnd)
+                guard bytes[previous] == 0x20 || bytes[previous] == 0x09 else { break }
+                textEnd = previous
+            }
+            let textStart = bytes.index(after: afterMarker)
+            let text = textStart < textEnd
+                ? String(decoding: bytes[textStart..<textEnd], as: UTF8.self)
+                : ""
             return MarkdownListItemData(depth: depth, ordered: false, index: 0, text: text)
         }
 
         // Ordered: 1. 2. etc
-        guard let match = Self.orderedListItemRegex.firstMatch(in: cleaned, range: range) else {
+        let digitsStart = cursor
+        var itemIndex = 0
+        var indexOverflowed = false
+        while cursor < bytes.endIndex, bytes[cursor] >= 0x30, bytes[cursor] <= 0x39 {
+            if !indexOverflowed {
+                let (multiplied, multiplyOverflow) = itemIndex.multipliedReportingOverflow(by: 10)
+                let (advanced, addOverflow) = multiplied.addingReportingOverflow(
+                    Int(bytes[cursor] - 0x30))
+                indexOverflowed = multiplyOverflow || addOverflow
+                if !indexOverflowed { itemIndex = advanced }
+            }
+            cursor = bytes.index(after: cursor)
+        }
+        if cursor < bytes.endIndex, bytes[cursor] >= 0x80 {
+            return parseUnicodeListItemLine(cleaned)
+        }
+        guard cursor > digitsStart, cursor < bytes.endIndex, bytes[cursor] == 0x2E else {
             return nil
         }
+        cursor = bytes.index(after: cursor)
+        if cursor < bytes.endIndex {
+            if bytes[cursor] >= 0x80 { return parseUnicodeListItemLine(cleaned) }
+            guard isASCIIWhitespace(bytes[cursor]) else { return nil }
+            while cursor < bytes.endIndex {
+                if bytes[cursor] >= 0x80 { return parseUnicodeListItemLine(cleaned) }
+                if !isASCIIWhitespace(bytes[cursor]) { break }
+                cursor = bytes.index(after: cursor)
+            }
+        }
+        // ICU's `$` anchor matches before a final CR in CRLF input, so the old
+        // regex excluded that terminator from ordered-item text.
+        var textEnd = bytes.endIndex
+        if let last = bytes.last, last == 0x0A || last == 0x0D {
+            textEnd = bytes.index(before: textEnd)
+        } else if bytes.last.map({ $0 >= 0x80 }) == true,
+                  cleaned.last?.isNewline == true {
+            return parseUnicodeListItemLine(cleaned)
+        }
+        let text = cursor < textEnd
+            ? String(decoding: bytes[cursor..<textEnd], as: UTF8.self)
+            : ""
 
-        // Defensive: group 2 is `(\d+)`, so a successful match always has it —
-        // but never force-unwrap in the streaming parse path. If the range can't
-        // be mapped, treat the line as not-a-list-item (it falls through to a
-        // paragraph) instead of trapping and crashing the app.
-        guard let indexRange = Range(match.range(at: 2), in: cleaned) else { return nil }
-        let itemIndex = Int(cleaned[indexRange]) ?? 1
+        return MarkdownListItemData(
+            depth: depth, ordered: true, index: indexOverflowed ? 1 : itemIndex, text: text)
+    }
 
-        // Group 4 is the text after the space; may be absent for bare markers like "1."
-        let textRange = match.range(at: 4).location != NSNotFound
-            ? Range(match.range(at: 4), in: cleaned)
-            : nil
-        let text = textRange.map { String(cleaned[$0]) } ?? ""
+    private static func parseUnicodeListItemLine(_ line: String) -> MarkdownListItemData? {
+        var cursor = line.startIndex
+        var spaces = 0
+        var tabs = 0
+        var countsTowardDepth = true
+        while cursor < line.endIndex, line[cursor].isWhitespace {
+            if countsTowardDepth, line[cursor] == " " {
+                spaces += 1
+            } else if countsTowardDepth, line[cursor] == "\t" {
+                tabs += 1
+            } else {
+                countsTowardDepth = false
+            }
+            cursor = line.index(after: cursor)
+        }
+        guard cursor < line.endIndex else { return nil }
+        let depth = tabs + spaces / 2
+        let marker = line[cursor]
 
-        return MarkdownListItemData(depth: depth, ordered: true, index: itemIndex, text: text)
+        if marker == "-" || marker == "*" || marker == "+" {
+            let afterMarker = line.index(after: cursor)
+            guard afterMarker == line.endIndex || line[afterMarker].isWhitespace else {
+                return nil
+            }
+            let stripped = line.trimmingCharacters(in: .whitespaces)
+            let text = stripped.count > 1 ? String(stripped.dropFirst(2)) : ""
+            return MarkdownListItemData(depth: depth, ordered: false, index: 0, text: text)
+        }
+
+        let digitsStart = cursor
+        while cursor < line.endIndex,
+              line[cursor].unicodeScalars.allSatisfy({
+                  $0.properties.generalCategory == .decimalNumber
+              }) {
+            cursor = line.index(after: cursor)
+        }
+        guard cursor > digitsStart, cursor < line.endIndex, line[cursor] == "." else {
+            return nil
+        }
+        let itemIndex = Int(line[digitsStart..<cursor]) ?? 1
+        cursor = line.index(after: cursor)
+        guard cursor == line.endIndex || line[cursor].isWhitespace else { return nil }
+        while cursor < line.endIndex, line[cursor].isWhitespace {
+            cursor = line.index(after: cursor)
+        }
+        let textEnd = line.last?.isNewline == true
+            ? line.index(before: line.endIndex)
+            : line.endIndex
+        let text = cursor < textEnd ? String(line[cursor..<textEnd]) : ""
+        return MarkdownListItemData(
+            depth: depth, ordered: true, index: itemIndex, text: text)
     }
 
     // MARK: Table
+
+    /// Splits one all-ASCII table row into trimmed cells in a single byte pass.
+    /// The general path trims the row, copies it without its edge pipes, splits,
+    /// then trims every field again — four allocations per cell, repaid on every
+    /// streamed flush because a growing table re-parses all of its rows. Returns
+    /// nil for non-ASCII rows, where Unicode whitespace has to decide the edges.
+    private static func parseASCIITableCells(_ line: String) -> [String]? {
+        line.utf8.withContiguousStorageIfAvailable { buffer -> [String]? in
+            for byte in buffer where byte >= 0x80 { return nil }
+            @inline(__always) func isSpace(_ byte: UInt8) -> Bool { byte == 0x20 || byte == 0x09 }
+            var low = 0
+            var high = buffer.count
+            while low < high, isSpace(buffer[low]) { low += 1 }
+            while high > low, isSpace(buffer[high - 1]) { high -= 1 }
+            if low < high, buffer[low] == 0x7C { low += 1 }
+            if high > low, buffer[high - 1] == 0x7C { high -= 1 }
+
+            var cells: [String] = []
+            cells.reserveCapacity(4)
+            var fieldStart = low
+            var index = low
+            @inline(__always) func appendCell(_ end: Int) {
+                var start = fieldStart
+                var stop = end
+                while start < stop, isSpace(buffer[start]) { start += 1 }
+                while stop > start, isSpace(buffer[stop - 1]) { stop -= 1 }
+                cells.append(String(decoding: buffer[start..<stop], as: UTF8.self))
+            }
+            while index < high {
+                if buffer[index] == 0x7C {
+                    appendCell(index)
+                    fieldStart = index + 1
+                }
+                index += 1
+            }
+            appendCell(high)
+            return cells
+        } ?? nil
+    }
 
     static func parseTable(lines: [String], startIndex: Int) -> ParseResult? {
         guard startIndex + 1 < lines.count else { return nil }
 
         let headerLine = lines[startIndex]
-        let separatorLine = lines[startIndex + 1]
-
-        let sepTrimmed = separatorLine.trimmingCharacters(in: .whitespaces)
         // A GFM table delimiter row is composed ENTIRELY of pipes, dashes,
-        // colons, and whitespace. Anchor to the whole line (^…$) — a prefix-only
-        // match falsely treats list items like "- foo `a|b`" (which start with
-        // "- " and contain a pipe) as separators, swallowing them into an empty table.
-        guard sepTrimmed.contains("|"),
-              isTableDelimiterRow(sepTrimmed),
-              sepTrimmed.contains("-") else {
+        // colons, and whitespace. Whole-line validation prevents list items like
+        // "- foo `a|b`" from being swallowed into an empty table.
+        guard isTableDelimiterRow(lines[startIndex + 1]) else {
             return nil
         }
 
         func parseCells(_ line: String) -> [String] {
-            var raw = line.trimmingCharacters(in: .whitespaces)
-            if raw.hasPrefix("|") { raw = String(raw.dropFirst()) }
-            if raw.hasSuffix("|") { raw = String(raw.dropLast()) }
-            return raw.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+            if let ascii = parseASCIITableCells(line) { return ascii }
+            let raw = trimmingHorizontalWhitespace(line)
+            let start = raw.first == "|" ? raw.index(after: raw.startIndex) : raw.startIndex
+            let end = raw.last == "|" && start != raw.endIndex
+                ? raw.index(before: raw.endIndex)
+                : raw.endIndex
+            let cells = start == raw.startIndex && end == raw.endIndex
+                ? raw
+                : String(raw[start..<end])
+            return splitASCII(cells, separator: 0x7C).map {
+                trimmingHorizontalWhitespace($0)
+            }
         }
 
         let header = parseCells(headerLine)
         guard !header.isEmpty else { return nil }
 
         var rows: [[String]] = []
+        rows.reserveCapacity(min(max(0, lines.count - startIndex - 2), 16))
         var i = startIndex + 2
         while i < lines.count {
-            let rowLine = lines[i].trimmingCharacters(in: .whitespaces)
-            guard rowLine.contains("|"), !rowLine.isEmpty else { break }
+            guard containsByte(lines[i].utf8, 0x7C) else { break }
             rows.append(parseCells(lines[i]))
             i += 1
         }
@@ -709,11 +1248,9 @@ extension MarkdownParser {
     // MARK: Paragraph
 
     static func parseParagraph(lines: [String], startIndex: Int) -> ParseResult {
-        var paraLines: [String] = []
         var i = startIndex
         while i < lines.count {
             let line = lines[i]
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
 
             // Break conditions stop a paragraph when a NEW block begins — but they
             // apply only to *continuation* lines (i > startIndex). The first line
@@ -725,28 +1262,48 @@ extension MarkdownParser {
             // parse()'s loop. Consuming it renders the line as literal paragraph
             // text, which is also what CommonMark does for a non-heading "#…".
             if i > startIndex {
-                if trimmed.isEmpty
-                    || trimmed.hasPrefix("#")
-                    || trimmed.hasPrefix("```")
-                    || trimmed.hasPrefix("~~~")
-                    || trimmed.hasPrefix(">")
-                    || isThematicBreak(line) {
+                let firstIndex = line.firstIndex(where: { !$0.isWhitespace })
+                let first = firstIndex.map { line[$0] }
+                let startsFence = firstIndex.map { index in
+                    let suffix = line[index...]
+                    return (first == "`" && suffix.hasPrefix("```"))
+                        || (first == "~" && suffix.hasPrefix("~~~"))
+                } ?? false
+                if first == nil
+                    || first == "#"
+                    || startsFence
+                    || first == ">"
+                    || ((first == "-" || first == "*" || first == "_")
+                        && isThematicBreak(line)) {
                     break
                 }
-                if i + 1 < lines.count {
-                    let nextTrimmed = lines[i + 1].trimmingCharacters(in: .whitespaces)
-                    if nextTrimmed.contains("|"), nextTrimmed.contains("-"),
-                       isTableDelimiterRow(nextTrimmed) {
-                        break
-                    }
+                if i + 1 < lines.count,
+                   isTableDelimiterRow(lines[i + 1]) {
+                    break
                 }
             }
 
-            paraLines.append(line)
             i += 1
         }
 
-        let text = paraLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let text: String
+        if i == startIndex + 1 {
+            let line = lines[startIndex]
+            if let first = line.first, let last = line.last,
+               !isTrimmableWhitespace(first), !isTrimmableWhitespace(last) {
+                text = line
+            } else {
+                text = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        } else {
+            let joined = lines[startIndex..<i].joined(separator: "\n")
+            if let first = joined.first, let last = joined.last,
+               !isTrimmableWhitespace(first), !isTrimmableWhitespace(last) {
+                text = joined
+            } else {
+                text = joined.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
         return ParseResult(block: .paragraph(text: text, alignment: .leading), nextIndex: i)
     }
 }
