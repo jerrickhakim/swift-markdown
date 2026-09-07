@@ -25,28 +25,54 @@ import SwiftUI
 /// test corpus): emphasis may match across link boundaries, link text cannot
 /// contain nested links, and single `~` is never strikethrough (GFM allows it;
 /// `~~` only here, matching remend).
-enum InlineMarkdown {
+public enum InlineMarkdown {
 
   // MARK: - Style
 
-  struct Style: Equatable {
-    var fontSize: CGFloat
-    var baseWeight: Font.Weight
-    var strongWeight: Font.Weight
-    var textColor: Color
-    var codeScale: CGFloat
+  public struct Style: Equatable {
+    public var fontSize: CGFloat
+    public var baseWeight: Font.Weight
+    public var strongWeight: Font.Weight
+    public var textColor: Color
+    public var codeScale: CGFloat
     /// nil → inline code uses `textColor`.
-    var codeColor: Color?
+    public var codeColor: Color?
     /// nil → no fill behind inline code.
-    var codeBackground: Color?
-    var linkColor: Color
+    public var codeBackground: Color?
+    public var linkColor: Color
     /// `<mark>` highlight fill.
-    var markHighlight: Color = Color.yellow.opacity(0.30)
+    public var markHighlight: Color = Color.yellow.opacity(0.30)
     /// `<kbd>` key-chip fill.
-    var kbdBackground: Color = Color.primary.opacity(0.10)
+    public var kbdBackground: Color = Color.primary.opacity(0.10)
     /// Whole-block italics (block quotes). Carried in the style — a SwiftUI
     /// `.italic()` view modifier can't reach the UIKit-backed selectable path.
-    var italic: Bool = false
+    public var italic: Bool = false
+
+    public init(
+      fontSize: CGFloat,
+      baseWeight: Font.Weight,
+      strongWeight: Font.Weight,
+      textColor: Color,
+      codeScale: CGFloat,
+      codeColor: Color? = nil,
+      codeBackground: Color? = nil,
+      linkColor: Color,
+      markHighlight: Color = Color.yellow.opacity(0.30),
+      kbdBackground: Color = Color.primary.opacity(0.10),
+      italic: Bool = false
+    ) {
+      self.fontSize = fontSize
+      self.baseWeight = baseWeight
+      self.strongWeight = strongWeight
+      self.textColor = textColor
+      self.codeScale = codeScale
+      self.codeColor = codeColor
+      self.codeBackground = codeBackground
+      self.linkColor = linkColor
+      self.markHighlight = markHighlight
+      self.kbdBackground = kbdBackground
+      self.italic = italic
+    }
   }
 
   // MARK: - Trait Runs
@@ -145,7 +171,7 @@ enum InlineMarkdown {
     }
   }
 
-  static func attributedString(
+  public static func attributedString(
     _ markdown: String, style: Style, isTail: Bool = false
   ) -> AttributedString {
     var out = AttributedString()

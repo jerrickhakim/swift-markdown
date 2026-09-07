@@ -177,7 +177,7 @@ public final class StableMarkdownParser {
     /// Chat text deltas only ever append to a part. That caller can skip the
     /// settled-prefix byte comparison; generic document/editor callers keep the
     /// defensive `update(markdown:)` path because their source may change anywhere.
-    func updateAppending(markdown: String) {
+    public func updateAppending(markdown: String) {
         update(markdown: markdown, isKnownAppend: true)
     }
 

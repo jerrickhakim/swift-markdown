@@ -29,6 +29,11 @@ let package = Package(
       resources: [
         .process("Resources")
       ]
+    ),
+    .testTarget(
+      name: "JerrickMarkdownTests",
+      dependencies: ["JerrickMarkdown"],
+      path: "Tests/JerrickMarkdownTests"
     )
   ],
   swiftLanguageModes: [.v5]

@@ -88,7 +88,7 @@ public struct MarkdownStyle: Equatable {
   // MARK: - Derived inline styles
 
   /// Inline style for body-sized prose (paragraphs, list items, quotes).
-  var inline: InlineMarkdown.Style {
+  public var inline: InlineMarkdown.Style {
     InlineMarkdown.Style(
       fontSize: baseSize,
       baseWeight: baseWeight,
