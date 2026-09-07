@@ -85,18 +85,19 @@ final class CodeStreamingTextView: UITextView {
 // MARK: - Representable
 
 /// Streams a code block's text with the word-fade reveal and native
-/// selection. Plain monospaced text renders immediately; highlight.js colors
-/// land later as an attribute-only update, which the fade engine applies
-/// without disturbing in-flight reveals (fading tokens continue fading into
-/// their syntax colors).
+/// selection. Syntax colors arrive with the text (the highlighter is
+/// synchronous), and later attribute-only updates are applied without
+/// disturbing in-flight reveals.
 struct CodeStreamingText: UIViewRepresentable {
   let code: String
-  /// Highlighted lines from `CodeBlockHighlightModel`, aligned with `code`'s
+  /// Highlighted lines from `NativeSyntaxHighlighter`, aligned with `code`'s
   /// lines. A line's colors apply only while its text still matches the live
-  /// code — during streaming the highlight lags by a throttle interval, and a
-  /// stale line must render plain rather than show old colors.
+  /// code, so a stale line renders plain rather than showing old colors.
   var highlightedLines: [AttributedString]?
   var isStreaming: Bool = false
+  /// Changes on foreground so an on-screen view repaints instead of skipping
+  /// the rebuild on unchanged inputs (`CodeBlockRenderGeneration`).
+  var generation: Int = 0
   var fontSize: CGFloat = 13
   var lineSpacing: CGFloat = 5
 
@@ -110,6 +111,7 @@ struct CodeStreamingText: UIViewRepresentable {
     let code: String
     let highlightedLines: [AttributedString]?
     let isStreaming: Bool
+    let generation: Int
     let fontSize: CGFloat
     let lineSpacing: CGFloat
   }
@@ -118,7 +120,7 @@ struct CodeStreamingText: UIViewRepresentable {
     view.selectionEnabled = !isStreaming
     let inputs = RenderInputs(
       code: code, highlightedLines: highlightedLines, isStreaming: isStreaming,
-      fontSize: fontSize, lineSpacing: lineSpacing)
+      generation: generation, fontSize: fontSize, lineSpacing: lineSpacing)
     guard view.renderedInputs != inputs else { return }
     view.renderedInputs = inputs
     view.setContents(attributedCode(), animated: isStreaming)

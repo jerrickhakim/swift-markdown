@@ -11,16 +11,14 @@ public struct CodeBlock: View {
     /// When false, the block renders fully visible with no reveal motion —
     /// used for settled/historical blocks so scrollback doesn't re-animate.
     public var animated: Bool
-    /// True while the block is the live streaming tail: highlight requests
-    /// are throttled so highlight.js doesn't re-run per flush.
+    /// True while the block is the live streaming tail.
     public var isStreaming: Bool
     public var startDelay: Double
     public var theme: MarkdownTheme
 
     /// When non-empty, the body renders a unified diff (gutter line numbers,
     /// `+`/`−` prefixes, add/delete row tinting) inside the normal code-block
-    /// chrome instead of the plain highlighted code. Used by the edit-tool
-    /// dropdown and `diff`-fenced markdown blocks.
+    /// chrome instead of the plain highlighted code.
     public var diffLines: [MarkdownDiffLine]?
     /// Optional file name shown in the header (diff/edit context). Falls back
     /// to the detected language label when nil.
@@ -49,26 +47,16 @@ public struct CodeBlock: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var revealed = false
-    @State private var highlight = CodeBlockHighlightModel()
 
     private static let cornerRadius: CGFloat = 16
-
-    /// Equatable key for the highlight task — restarts on content, language,
-    /// appearance, or streaming-state changes.
-    private struct HighlightRequest: Equatable {
-        let code: String
-        let language: String?
-        let dark: Bool
-        let streaming: Bool
-    }
 
     private var isDiff: Bool { !(diffLines?.isEmpty ?? true) }
 
     public var body: some View {
         // Trim once per render and thread it through. `code.trimmingCharacters`
-        // is O(n) and was recomputed independently by `.task(id:)`, `codeLines`,
-        // and `lineCountKey` — three full string copies per delta on a streaming
-        // block. One copy now feeds all three.
+        // is O(n) and was recomputed independently by `codeLines` and
+        // `lineCountKey` — two full string copies per delta on a streaming
+        // block. One copy now feeds both.
         let trimmed = code.trimmingCharacters(in: .newlines)
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -111,24 +99,6 @@ public struct CodeBlock: View {
                 withTransaction(transaction) { revealed = true }
             }
         }
-        .task(
-            id: HighlightRequest(
-                code: trimmed,
-                language: highlightLanguage,
-                dark: colorScheme == .dark,
-                streaming: isStreaming
-            )
-        ) {
-            // Diff mode renders its own per-line tinting via UnifiedDiffView;
-            // the whole-block highlighter doesn't apply.
-            guard !isDiff else { return }
-            highlight.setNeedsHighlight(
-                code: trimmed,
-                language: highlightLanguage,
-                dark: colorScheme == .dark,
-                throttled: isStreaming
-            )
-        }
     }
 
     // MARK: - Sub-views
@@ -166,13 +136,13 @@ public struct CodeBlock: View {
     private func codeLines(_ trimmed: String) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             // One UITextView for the whole body: code tokens fade in with the
-            // same word wave as prose (shared WordFadeEngine), highlight.js
-            // colors land as attribute-only updates that don't disturb
-            // in-flight fades, and the block is natively selectable.
+            // same word wave as prose (shared WordFadeEngine) and the block is
+            // natively selectable.
             CodeStreamingText(
                 code: trimmed,
-                highlightedLines: highlight.highlightedLines,
-                isStreaming: isStreaming
+                highlightedLines: cachedLines(trimmed),
+                isStreaming: isStreaming,
+                generation: CodeBlockRenderGeneration.shared.value
             )
             .padding(.vertical, 8)
             .padding(.horizontal, 14)
@@ -189,8 +159,22 @@ public struct CodeBlock: View {
         return trimmed.reduce(into: 1) { count, ch in if ch == "\n" { count += 1 } }
     }
 
-    /// Fence hint for highlight.js (it resolves aliases like `ts`/`py`
-    /// natively); nil lets it auto-detect bare ``` fences.
+    /// Colors for this block, resolved synchronously during `body` so it paints
+    /// on its first frame — cache first, then the native highlighter. A bare
+    /// fence names no language and stays plain by design.
+    private func cachedLines(_ trimmed: String) -> [AttributedString]? {
+        guard let language = highlightLanguage else { return nil }
+        let key = CodeBlockHighlightCache.key(code: trimmed, language: language)
+        if let cached = CodeBlockHighlightCache.shared.lines(for: key) { return cached }
+        guard
+            let lines = NativeSyntaxHighlighter.lines(code: trimmed, language: language)
+        else { return nil }
+        CodeBlockHighlightCache.shared.store(lines, for: key)
+        return lines
+    }
+
+    /// Fence hint (`SyntaxLanguages` resolves aliases like `ts`/`py`); nil for
+    /// a bare ``` fence, which renders plain.
     private var highlightLanguage: String? {
         guard let language = language?.trimmingCharacters(in: .whitespaces).lowercased(),
             !language.isEmpty
@@ -198,8 +182,12 @@ public struct CodeBlock: View {
         return language
     }
 
+    /// Header language: the fence, or "plain text" when it named none — the
+    /// same condition that leaves the block unhighlighted, so the label can
+    /// never disagree with the colors.
     private var displayLanguage: String {
-        CodeBlockHelpers.guessFileType(code: code, explicitLanguage: language)
+        guard let explicit = highlightLanguage else { return "plain text" }
+        return CodeBlockHelpers.normalizedLanguage(explicit)
     }
 
     /// File extension driving the header icon — same icon the file tree uses.

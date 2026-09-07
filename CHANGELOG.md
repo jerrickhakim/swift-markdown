@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Tables no longer clip their header and last rows. A table whose columns fit
+  the container lays out at the container width and wraps long cells; wider
+  tables scroll horizontally. `SelectableMarkdownText` now answers SwiftUI's
+  ideal-size probe with its unwrapped size so measured and rendered heights
+  agree.
+- Table cells are UIKit-backed `SelectableMarkdownText`, giving them the same
+  grabber-handle selection as prose.
+- Native synchronous syntax highlighter (`NativeSyntaxHighlighter`) replaces
+  Highlightr and the bundled highlight.js: colors land with the text on the
+  first frame, results are cached above the view tree, and blocks repaint on
+  foreground. The `Highlightr` dependency and `highlight.min.js` resource are
+  removed. A bare ``` fence renders plain instead of guessing a language.
+- Streaming parser folds appended bytes into the open block for paragraphs,
+  lists, tables, block quotes, fenced code, and `<details>` bodies instead of
+  re-parsing the whole tail on every flush.
 - Streaming parser fast paths: incremental tail-line reuse for append-only
   updates, plain-paragraph and list-item append tracking, and byte-based stable
   offsets so a long response no longer re-splits its tail on every flush.

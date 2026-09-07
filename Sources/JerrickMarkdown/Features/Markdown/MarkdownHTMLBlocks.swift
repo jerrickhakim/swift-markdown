@@ -70,6 +70,23 @@ extension MarkdownParser {
       nextIndex: collected.nextIndex)
   }
 
+  static func detailsBodyForAppending(lines: [String]) -> String? {
+    let chars = Array(lines.joined(separator: "\n"))
+    guard let outer = scanTag(chars, at: 0, name: "details"), !outer.terminated else {
+      return nil
+    }
+    let inner = String(chars[outer.contentStart..<outer.contentEnd])
+    let innerChars = Array(inner)
+    if let summaryStart = firstTagOpen(innerChars, name: "summary") {
+      guard let summary = scanTag(innerChars, at: summaryStart, name: "summary"),
+            summary.terminated else { return nil }
+    }
+    let (_, body) = extractSummary(inner)
+    guard !containsByte(body.utf8, 0x3C),
+          let first = body.firstIndex(where: { !$0.isWhitespace }) else { return nil }
+    return String(body[first...])
+  }
+
   /// Splits a `<details>` body into its `<summary>` (if any) and the remaining
   /// body content. The summary is returned raw so the caller can parse it as
   /// blocks (a `<summary>` may wrap a fenced code block).

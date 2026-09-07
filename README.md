@@ -6,8 +6,8 @@ diffs, tables, math, lists, block quotes, links, and supported HTML blocks.
 
 - Swift product and module: `JerrickMarkdown`
 - Platform: iOS 17 or newer
-- External packages: `SwiftUIMath` and `Highlightr`
-- Runtime resources: bundled highlight.js and file-type SVG assets
+- External package: `SwiftUIMath`
+- Runtime resources: file-type SVG assets
 
 ## Install with Swift Package Manager
 
@@ -283,7 +283,7 @@ The renderer supports:
 
 - headings, paragraphs, emphasis, strong text, strike-through, inline code,
   links, and common inline HTML formatting;
-- fenced code blocks with language detection and syntax highlighting;
+- fenced code blocks with native syntax highlighting;
 - ordered and unordered lists, block quotes, thematic breaks, and tables;
 - `$$` display math through `SwiftUIMath`;
 - HTML tables, code blocks, block quotes, paragraphs, headings, and

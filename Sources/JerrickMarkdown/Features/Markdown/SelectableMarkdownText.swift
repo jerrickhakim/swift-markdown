@@ -188,7 +188,12 @@ final class SelectableTextView: UITextView {
     // Round up on the pixel grid, not to a whole point — sub-point height
     // inflation across many blocks reads as drift against sibling views.
     let scale = max(1, traitCollection.displayScale)
-    let size = CGSize(width: width, height: (fitted.height * scale).rounded(.up) / scale)
+    // An unbounded width is the ideal-size probe: report the unwrapped width
+    // so a Grid column sizes to its text instead of UITextView's stale
+    // intrinsic size.
+    let size = CGSize(
+      width: width.isFinite ? width : ceil(fitted.width),
+      height: (fitted.height * scale).rounded(.up) / scale)
     cachedWidth = key
     cachedSize = size
     return size
@@ -262,14 +267,19 @@ struct SelectableMarkdownText: UIViewRepresentable {
   func sizeThatFits(
     _ proposal: ProposedViewSize, uiView: SelectableTextView, context: Context
   ) -> CGSize? {
-    guard let width = proposal.width, width > 0, width.isFinite else { return nil }
+    guard proposal.width != 0 else { return nil }
+    // A nil or infinite width is SwiftUI's ideal-size probe (a Grid sizing
+    // its columns, a horizontal ScrollView); answer with the unwrapped text
+    // size so the ideal and final measurements agree.
+    let width = proposal.width.map { $0.isFinite ? $0 : .greatestFiniteMagnitude }
+      ?? CGFloat.greatestFiniteMagnitude
     // A streaming block whose committed text draws nothing yet (holdback,
     // dangling markers) must occupy ZERO height — UITextView would otherwise
     // reserve a full empty line, and that phantom line is what used to shift
     // the list when the parser re-typed a speculative block. Settled blocks
     // keep the system measurement.
     if isStreaming, uiView.attributedText.length == 0 {
-      return CGSize(width: width, height: 0)
+      return CGSize(width: width.isFinite ? width : 0, height: 0)
     }
     return uiView.sizeFitting(width: width)
   }

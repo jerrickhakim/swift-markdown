@@ -463,42 +463,36 @@ private struct MarkdownTable: View {
     max(header.count, rows.map(\.count).max() ?? 0)
   }
 
-  var body: some View {
-    ScrollView(.horizontal, showsIndicators: false) {
-      Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-        GridRow {
-          ForEach(0..<columnCount, id: \.self) { col in
-            cell(
-              text: header.indices.contains(col) ? header[col] : "",
-              row: 0, col: col)
-          }
-        }
+  /// Narrowest a column can be laid out: the cell's `minWidth` plus its
+  /// horizontal padding.
+  private static let minColumnWidth: CGFloat = 80 + 28
 
-        ForEach(rows.indices, id: \.self) { rowIndex in
-          GridRow {
-            ForEach(0..<columnCount, id: \.self) { col in
-              cell(
-                text: rows[rowIndex].indices.contains(col) ? rows[rowIndex][col] : "",
-                row: rowIndex + 1, col: col
-              )
-            }
-          }
-        }
+  /// A table whose columns can all shrink to their minimum inside the
+  /// container lays out at the container width and wraps long cells; a wider
+  /// table keeps every cell on one line and scrolls horizontally. Column
+  /// count decides, not text width, so cell heights are measured at the
+  /// width they render at — an ideal-width measurement inside a horizontal
+  /// ScrollView is what used to clip the top and bottom rows.
+  private var fitsContainer: Bool {
+    availableWidth <= 0 || CGFloat(columnCount) * Self.minColumnWidth <= availableWidth
+  }
+
+  var body: some View {
+    Group {
+      if fitsContainer {
+        grid.frame(maxWidth: .infinity, alignment: .leading)
+      } else {
+        ScrollView(.horizontal, showsIndicators: false) { grid }
+          // A horizontal ScrollView is flexible vertically; size it to the
+          // Grid so a tall table never takes a shorter proposed height.
+          .fixedSize(horizontal: false, vertical: true)
       }
-      // Stretch a narrow table to the scroll container's width so header and
-      // row fills span the full available content width. Wide tables keep
-      // their ideal width and scroll horizontally as before.
-      .frame(minWidth: availableWidth > 0 ? availableWidth : nil, alignment: .leading)
     }
     .onGeometryChange(for: CGFloat.self) { proxy in
       proxy.size.width
     } action: { width in
       availableWidth = width
     }
-    // Selection is owned here (not by a chat-level ancestor) so the
-    // streaming tail stays free of .textSelection, which would kill the
-    // prose word-fade TextRenderer. Table cells never use one.
-    .textSelection(.enabled)
     .background(containerBackground)
     .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
     // The container chrome fades in with the first cells instead of popping
@@ -506,6 +500,29 @@ private struct MarkdownTable: View {
     .streamingChromeFade(isStreamingTail)
     .onChange(of: revealSignature, initial: true) {
       revealNewlyReadyCells()
+    }
+  }
+
+  private var grid: some View {
+    Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+      GridRow {
+        ForEach(0..<columnCount, id: \.self) { col in
+          cell(
+            text: header.indices.contains(col) ? header[col] : "",
+            row: 0, col: col)
+        }
+      }
+
+      ForEach(rows.indices, id: \.self) { rowIndex in
+        GridRow {
+          ForEach(0..<columnCount, id: \.self) { col in
+            cell(
+              text: rows[rowIndex].indices.contains(col) ? rows[rowIndex][col] : "",
+              row: rowIndex + 1, col: col
+            )
+          }
+        }
+      }
     }
   }
 
@@ -522,18 +539,22 @@ private struct MarkdownTable: View {
     // Row fills live on the cell (a GridRow background paints each cell view
     // individually anyway) so each cell's tint fades in with its text. The
     // cell must fill its grid cell or the fill only hugs the text.
-    return Text(InlineMarkdown.attributedString(text, style: inline))
-      .lineSpacing(style.baseSize * 0.25)
-      .frame(minWidth: 80, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-      .padding(.vertical, 10)
-      .padding(.horizontal, 14)
-      .background(rowFill(row))
-      .opacity(revealed ? 1 : 0)
-      .animation(
-        .easeOut(duration: MarkdownReveal.streamFadeDuration)
-          .delay(cellDelays[key] ?? 0),
-        value: revealed
-      )
+    // UIKit-backed like prose and code blocks: SwiftUI's .textSelection never
+    // takes on these cells, so cells carry the same SelectableTextView that
+    // gives real grabber-handle selection everywhere else in the chat.
+    return SelectableMarkdownText(
+      markdown: text, style: inline, lineSpacing: style.baseSize * 0.25
+    )
+    .frame(minWidth: 80, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    .padding(.vertical, 10)
+    .padding(.horizontal, 14)
+    .background(rowFill(row))
+    .opacity(revealed ? 1 : 0)
+    .animation(
+      .easeOut(duration: MarkdownReveal.streamFadeDuration)
+        .delay(cellDelays[key] ?? 0),
+      value: revealed
+    )
   }
 
   // MARK: Cell reveal

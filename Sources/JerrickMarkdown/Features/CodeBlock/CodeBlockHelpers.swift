@@ -1,25 +1,12 @@
 import Foundation
 
-/// Guesses the programming language from code content when markdown doesn't specify it.
-/// Used when code blocks use plain ``` without a language identifier.
+/// Presentation helpers for code blocks.
 enum CodeBlockHelpers {
-
-    /// Returns the best-guess language for a code block.
-    /// - Parameters:
-    ///   - code: The raw code content
-    ///   - explicitLanguage: Language from markdown fence (e.g. ```typescript)
-    /// - Returns: Normalized language string for display/highlighting
-    static func guessFileType(code: String, explicitLanguage: String?) -> String {
-        if let lang = explicitLanguage, !lang.trimmingCharacters(in: .whitespaces).isEmpty {
-            return normalizedLanguage(lang)
-        }
-        return guessFromContent(code)
-    }
 
     /// Keep fence normalization package-local. The original renderer used the
     /// host application's `FileTypes` utility, which is not part of this Swift
     /// package and made a clean remote build fail.
-    private static func normalizedLanguage(_ language: String) -> String {
+    static func normalizedLanguage(_ language: String) -> String {
         let lower = language.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         switch lower {
         case "ts": return "typescript"
@@ -48,7 +35,7 @@ enum CodeBlockHelpers {
         }
     }
 
-    /// Maps a canonical language name (as returned by `guessFileType`) to the file
+    /// Maps a canonical language name (as returned by `normalizedLanguage`) to the file
     /// extension used by `FileTypeIconView`, so a code block can show the same icon
     /// the file tree uses. Returns nil for `plain text` / unknown languages.
     static func fileExtension(forLanguage language: String) -> String? {
@@ -90,100 +77,5 @@ enum CodeBlockHelpers {
         // Fence hints that are already extensions pass straight through.
         default: return language.lowercased()
         }
-    }
-
-    /// Infer language from code content using heuristics (shebangs, imports, keywords)
-    private static func guessFromContent(_ code: String) -> String {
-        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        let firstLines = String(trimmed.prefix(800))
-        let lower = firstLines.lowercased()
-
-        // Shebang
-        if trimmed.hasPrefix("#!") {
-            if lower.contains("python") || lower.contains("python3") { return "python" }
-            if lower.contains("node") || lower.contains("nodejs") { return "javascript" }
-            if lower.contains("ruby") { return "ruby" }
-            if lower.contains("bash") || lower.contains("sh") { return "bash" }
-            if lower.contains("perl") { return "perl" }
-        }
-
-        // Imports / requires
-        if firstLines.contains("import ") && (firstLines.contains(" from ") || firstLines.contains("require(")) {
-            if firstLines.contains("React") || firstLines.contains("vue") || firstLines.contains("angular") {
-                return "typescript"
-            }
-            return "javascript"
-        }
-        if firstLines.contains("import ") && firstLines.contains(";") && !firstLines.contains(" from ") {
-            return "java"
-        }
-        if firstLines.contains("package ") && firstLines.contains("import ") {
-            return "go"
-        }
-        if firstLines.contains("use ") && firstLines.contains(";") && (firstLines.contains("std::") || firstLines.contains("namespace")) {
-            return "cpp"
-        }
-        if firstLines.contains("using ") && firstLines.contains(";") && firstLines.contains("namespace") {
-            return "csharp"
-        }
-        if firstLines.contains("import ") && !firstLines.contains(" from ") && !firstLines.contains(";") {
-            if firstLines.contains("swift") || firstLines.contains("Foundation") { return "swift" }
-            if firstLines.contains("dart") { return "dart" }
-        }
-        if firstLines.contains("require ") || firstLines.contains("require(") {
-            return "javascript"
-        }
-
-        // Keywords
-        if (lower.contains("def ") || lower.contains("class ") && lower.contains(":")) && lower.contains("import ") == false {
-            if lower.contains("self") || lower.contains("__init__") || lower.contains("lambda ") {
-                return "python"
-            }
-        }
-        if lower.contains("func ") && lower.contains("{") {
-            return "swift"
-        }
-        if lower.contains("fn ") && lower.contains("->") {
-            return "rust"
-        }
-        if lower.contains("func ") && lower.contains(")") && !lower.contains("->") {
-            return "go"
-        }
-        if lower.contains("interface ") || lower.contains("type ") && lower.contains("=") && lower.contains("{") {
-            return "typescript"
-        }
-        if lower.contains("const ") || lower.contains("let ") || lower.contains("var ") {
-            if lower.contains("=>") || lower.contains("async ") || lower.contains("await ") {
-                return "javascript"
-            }
-        }
-        if lower.contains("<?php") || lower.contains("<?=") {
-            return "php"
-        }
-        if trimmed.hasPrefix("<") && (lower.contains("<html") || lower.contains("<div") || lower.contains("<script")) {
-            return "html"
-        }
-        if lower.contains("select ") && lower.contains("from ") {
-            return "sql"
-        }
-        if lower.contains("insert into ") || lower.contains("create table") {
-            return "sql"
-        }
-        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
-            if lower.contains("\"") && (lower.contains(":") || lower.contains(",")) {
-                return "json"
-            }
-        }
-        if lower.contains("---") && (lower.contains("key:") || lower.contains("value:")) {
-            return "yaml"
-        }
-        if lower.contains("[") && lower.contains("]") && lower.contains("=") && !lower.contains("function") {
-            return "ini"
-        }
-        if lower.contains("from ") && lower.contains("run ") && lower.contains("copy ") {
-            return "dockerfile"
-        }
-
-        return "plain text"
     }
 }

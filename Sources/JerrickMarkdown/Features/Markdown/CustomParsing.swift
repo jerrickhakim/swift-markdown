@@ -115,27 +115,50 @@ public final class StableBlock: Identifiable {
 public final class StableMarkdownParser {
     public private(set) var blocks: [StableBlock] = []
 
+    /// Incremental bookkeeping — not observed, because `blocks` is the only
+    /// render input; routing this state through the registrar would charge every
+    /// streamed flush for observations no view ever makes.
+    ///
     /// Number of blocks whose content is finalized (won't change with more text).
-    private var stableCount = 0
+    @ObservationIgnored private var stableCount = 0
     /// UTF-8 byte offset in the source where the stable prefix ends — the start
     /// of the trailing (still-mutable) block. On next update we only parse from here.
-    private var stableUTF8Offset = 0
+    @ObservationIgnored private var stableUTF8Offset = 0
     /// The previous markdown string, used for the no-change fast path and the
     /// stable-prefix comparison.
-    private var previousMarkdown = ""
-    /// A known one-line prose tail cannot change block grammar until a newline.
-    private var appendingPlainParagraph = false
-    /// The tail is one list whose items map 1:1 onto `tailLines`. Until a newline
-    /// arrives only its final item can change, so the flush re-parses that one
-    /// line instead of every item in the run.
-    private var appendingListItems = false
+    @ObservationIgnored private var previousMarkdown = ""
+    /// The mutable tail's shape, when appended bytes can fold straight into the
+    /// trailing block instead of re-parsing the run it already holds. A streaming
+    /// list, quote, table, or fenced code block otherwise re-parses every line it
+    /// holds on every flush — quadratic in the block's own length, which is
+    /// exactly the shape a long list or code block streams in as.
+    private enum TailShape {
+        /// Re-parse the whole tail; nothing about it is safe to fold into.
+        case unknown
+        /// Raw prose retains whitespace that may become interior on the next append.
+        case paragraph(source: String)
+        /// Items before the unfinished source line, including across blank lines.
+        case list(settledItems: Int)
+        case details(bodyParser: StableMarkdownParser)
+        /// One table whose rows map 1:1 onto `tailLines` past the delimiter row.
+        case table
+        /// An open fence. Its body is copied verbatim, so the appended bytes are
+        /// exactly what the block's code gained.
+        case codeFence(marker: UInt8)
+        /// `settled` is the UNTRIMMED quote text of the first `settledLines`
+        /// lines — the block's own text is trimmed, so it can't be appended to.
+        case blockQuote(settled: String, settledLines: Int)
+    }
+    /// Re-established by every full tail parse; `.unknown` keeps the next update
+    /// on that path.
+    @ObservationIgnored private var tailShape: TailShape = .unknown
     /// The mutable tail's source lines, carried across updates. Splitting the
     /// tail was ~35% of a streamed list's parse time because a growing block
     /// re-split every line it already held on every flush; an append extends
     /// these in place instead, and sealing a block drops the lines it consumed.
-    private var tailLines: [String] = []
+    @ObservationIgnored private var tailLines: [String] = []
     /// Whether `tailLines` still describes `previousMarkdown[stableUTF8Offset...]`.
-    private var tailLinesValid = false
+    @ObservationIgnored private var tailLinesValid = false
 
     /// Re-parse only the trailing portion of the markdown string.
     ///
@@ -166,39 +189,26 @@ public final class StableMarkdownParser {
         // back to validation even if a caller accidentally uses the fast API.
         let utf8 = markdown.utf8
         let previousUTF8Count = previousMarkdown.utf8.count
-        let grew = utf8.count > previousUTF8Count
-        if isKnownAppend, grew, appendingPlainParagraph || appendingListItems,
-           blocks.count == stableCount + 1 {
-            let appendedStart = utf8.index(utf8.startIndex, offsetBy: previousUTF8Count)
-            if appendingListItems,
-               !MarkdownParser.containsByte(utf8[appendedStart...], 0x0A),
-               appendLastListItem(markdown: markdown, appended: utf8[appendedStart...]) {
-                previousMarkdown = markdown
-                return
-            }
-            if appendingPlainParagraph,
-               !MarkdownParser.containsByte(utf8[appendedStart...], 0x0A) {
-                let tailStart = utf8.index(utf8.startIndex, offsetBy: stableUTF8Offset)
-                let tail = String(markdown[tailStart...])
-                let text = tail.last.map(MarkdownParser.isTrimmableWhitespace) == true
-                    ? tail.trimmingCharacters(in: .whitespacesAndNewlines)
-                    : tail
-                let content = MarkdownBlockContent.paragraph(
-                    text: text, alignment: .leading)
-                if blocks[stableCount].content != content {
-                    blocks[stableCount].setContent(content)
-                }
-                // This path owns the tail too — the appended bytes carry no
-                // newline, so the cache stays a single line.
-                if tailLinesValid {
-                    if tailLines.count == 1 { tailLines[0] = tail } else { tailLinesValid = false }
-                }
+        let isAppend = isKnownAppend && utf8.count > previousUTF8Count
+
+        // Fold the appended bytes into the trailing block when the tail's shape
+        // makes that equivalent to re-parsing it. `tailLines` is brought current
+        // first because the slow path below needs it either way, so a fold that
+        // bails costs nothing beyond the work that update already owed.
+        var tailIsCurrent = false
+        if isAppend, tailLinesValid, !tailLines.isEmpty, blocks.count == stableCount + 1,
+           previousUTF8Count >= stableUTF8Offset {
+            let appended = utf8[utf8.index(utf8.startIndex, offsetBy: previousUTF8Count)...]
+            let openLine = tailLines.count - 1
+            refreshTailLines(
+                markdown: markdown, isAppend: true, previousUTF8Count: previousUTF8Count)
+            tailIsCurrent = true
+            if foldAppend(fromLine: openLine, appended: appended) {
                 previousMarkdown = markdown
                 return
             }
         }
-        appendingPlainParagraph = false
-        appendingListItems = false
+        tailShape = .unknown
 
         // The stable prefix is valid when the settled bytes are untouched — then
         // only the tail re-parses. Edits AFTER the stable offset (not just
@@ -206,7 +216,6 @@ public final class StableMarkdownParser {
         // reconciled. Otherwise the tail is the whole document: a response that
         // is still ONE block has no stable prefix, which is the common streaming
         // shape, so both cases run the same cached-line path from offset zero.
-        let isAppend = isKnownAppend && grew
         let prefixValid = stableCount > 0 && (isAppend || hasUnchangedStablePrefix(markdown))
         if !prefixValid {
             if stableUTF8Offset != 0 { tailLinesValid = false }
@@ -214,8 +223,10 @@ public final class StableMarkdownParser {
             stableUTF8Offset = 0
         }
 
-        refreshTailLines(
-            markdown: markdown, isAppend: isAppend, previousUTF8Count: previousUTF8Count)
+        if !tailIsCurrent {
+            refreshTailLines(
+                markdown: markdown, isAppend: isAppend, previousUTF8Count: previousUTF8Count)
+        }
         let tailBlocks = MarkdownParser.parse(lines: tailLines)
 
         // stableUTF8Offset points to the start of block[stableCount] (the trailing
@@ -236,44 +247,251 @@ public final class StableMarkdownParser {
             stableUTF8Offset = min(stableUTF8Offset, utf8.count)
             stableCount = newStable
         }
-        appendingPlainParagraph = tailBlocks.count == 1 && tailLines.count == 1
-            && MarkdownParser.plainSingleLineParagraphText(tailLines[0]) != nil
-        if tailBlocks.count == 1, case .list(let items) = tailBlocks[0] {
-            // A 1:1 item-to-line count means the run holds no blank lines, so
-            // the last line is unambiguously the last item.
-            appendingListItems = items.count == tailLines.count
-        }
+        tailShape = Self.tailShape(for: tailBlocks, lines: tailLines)
 
         previousMarkdown = markdown
     }
 
-    /// Folds bytes appended to the tail's final line back into the trailing list
-    /// item, leaving every earlier item untouched. Returns false when the new
-    /// line no longer reads as a plain item — a marker turning into a thematic
-    /// break, say — and the caller must re-parse the whole run.
-    private func appendLastListItem(markdown: String, appended: String.UTF8View.SubSequence) -> Bool {
-        guard tailLinesValid, !tailLines.isEmpty,
-              case .list(var items) = blocks[stableCount].content,
-              items.count == tailLines.count
-        else { return false }
+    /// Classifies a freshly parsed tail. Anything that isn't a single block whose
+    /// content maps line-for-line onto `lines` stays `.unknown`, which keeps the
+    /// next update on the full tail re-parse.
+    private static func tailShape(
+        for tailBlocks: [MarkdownBlockContent], lines: [String]
+    ) -> TailShape {
+        guard tailBlocks.count == 1, let last = lines.last else { return .unknown }
+        // A blank last line means the block already closed before it, so the
+        // line-to-content mapping is one short.
+        let blankLast = MarkdownParser.isHorizontalWhitespaceOnly(last)
+        switch tailBlocks[0] {
+        case .paragraph(_, let alignment):
+            guard alignment == .leading,
+                  MarkdownParser.plainSingleLineParagraphText(lines[0]) != nil,
+                  MarkdownParser.canAppendParagraphLines(lines, from: 0)
+            else { return .unknown }
+            return .paragraph(source: lines.joined(separator: "\n"))
+        case .list(let items):
+            let contiguous = items.count == lines.count
+                || (items.count == lines.count - 1 && blankLast)
+            if !contiguous {
+                var sourceItems = 0
+                for line in lines {
+                    if MarkdownParser.parseListItemLine(line) != nil {
+                        sourceItems += 1
+                    } else if !MarkdownParser.isHorizontalWhitespaceOnly(line) {
+                        return .unknown
+                    }
+                }
+                guard sourceItems == items.count else { return .unknown }
+            }
+            return .list(settledItems: items.count - (blankLast ? 0 : 1))
+        case .details:
+            guard let body = MarkdownParser.detailsBodyForAppending(lines: lines) else {
+                return .unknown
+            }
+            let parser = StableMarkdownParser()
+            parser.updateAppending(markdown: body)
+            guard case .paragraph = parser.tailShape else { return .unknown }
+            return .details(bodyParser: parser)
+        case .table(_, let rows):
+            guard lines.count >= 3 else { return .unknown }
+            let matches = rows.count == lines.count - 2
+                || (rows.count == lines.count - 3 && blankLast)
+            return matches ? .table : .unknown
+        case .codeBlock:
+            // `<pre>` HTML lands here too, and a fence that already closed keeps
+            // its body — only an OPEN fence takes the appended bytes as code.
+            guard lines.count >= 2 else { return .unknown }
+            let marker: UInt8
+            if MarkdownParser.hasFencePrefix(lines[0], 0x60) {
+                marker = 0x60
+            } else if MarkdownParser.hasFencePrefix(lines[0], 0x7E) {
+                marker = 0x7E
+            } else {
+                return .unknown
+            }
+            for index in 1..<lines.count
+            where MarkdownParser.hasFencePrefix(lines[index], marker) {
+                return .unknown
+            }
+            return .codeFence(marker: marker)
+        case .blockQuote:
+            return .blockQuote(settled: "", settledLines: 0)
+        default:
+            return .unknown
+        }
+    }
 
-        let line = tailLines[tailLines.count - 1] + String(decoding: appended, as: UTF8.self)
-        guard var item = MarkdownParser.parseListItemLine(line) else { return false }
-        if !item.ordered, MarkdownParser.startsWithThematicBreakMarker(item.text),
-           MarkdownParser.isThematicBreak(line) {
+    /// Folds appended bytes into the trailing block. `openLine` indexes the tail
+    /// line that was still growing before the append — every line before it is
+    /// settled. Returns false when the appended text changes the block's grammar
+    /// (a fence closes, an item turns into a rule, a row loses its pipes) and the
+    /// whole tail has to re-parse.
+    private func foldAppend(fromLine openLine: Int, appended: String.UTF8View.SubSequence) -> Bool {
+        switch tailShape {
+        case .unknown:
+            return false
+        case .paragraph(let source):
+            return foldParagraph(source: source, fromLine: openLine, appended: appended)
+        case .list(let settledItems):
+            return foldListItems(fromLine: openLine, settledItems: settledItems)
+        case .details(let bodyParser):
+            return foldDetails(bodyParser: bodyParser, appended: appended)
+        case .table:
+            return foldTableRows(fromLine: openLine)
+        case .codeFence(let marker):
+            return foldCodeFence(fromLine: openLine, marker: marker, appended: appended)
+        case .blockQuote(let settled, let settledLines):
+            return foldBlockQuote(settled: settled, settledLines: settledLines)
+        }
+    }
+
+    private func foldParagraph(
+        source: String, fromLine openLine: Int, appended: String.UTF8View.SubSequence
+    ) -> Bool {
+        guard MarkdownParser.canAppendParagraphLines(tailLines, from: openLine) else {
             return false
         }
-        // The run still ends at the source's end, so its final item stays open.
-        item.open = true
+        let updated = tailLines.count == 1
+            ? tailLines[0]
+            : source + String(decoding: appended, as: UTF8.self)
+        tailShape = .paragraph(source: updated)
+        setTailContent(.paragraph(text: MarkdownParser.trimmedIfNeeded(updated), alignment: .leading))
+        return true
+    }
 
-        tailLines[tailLines.count - 1] = line
-        // Only the final item can differ, so compare that one rather than
-        // walking the whole list to discover what we already know.
-        if item != items[items.count - 1] {
-            items[items.count - 1] = item
-            blocks[stableCount].setContent(.list(items: items))
+    private func foldDetails(
+        bodyParser: StableMarkdownParser, appended: String.UTF8View.SubSequence
+    ) -> Bool {
+        // Any HTML could close the container or change which text belongs to its summary.
+        guard !MarkdownParser.containsByte(appended, 0x3C),
+              case .details(let summary, let open, _) = blocks[stableCount].content
+        else { return false }
+        bodyParser.updateAppending(
+            markdown: bodyParser.previousMarkdown + String(decoding: appended, as: UTF8.self))
+        guard bodyParser.blocks.count == 1,
+              case .paragraph = bodyParser.blocks[0].content,
+              bodyParser.stableCount == 0
+        else { return false }
+        setTailContent(.details(summary: summary, open: open, blocks: [bodyParser.blocks[0].content]))
+        return true
+    }
+
+    private func foldListItems(fromLine openLine: Int, settledItems: Int) -> Bool {
+        guard case .list(let items) = blocks[stableCount].content,
+              settledItems <= items.count else { return false }
+
+        var updated = Array(items.prefix(settledItems))
+        // A previously open item closes even when this delta contains only blank lines.
+        if !updated.isEmpty { updated[updated.count - 1].open = false }
+        var nextSettledItems = updated.count
+        for index in openLine..<tailLines.count {
+            let line = tailLines[index]
+            if index == tailLines.count - 1 { nextSettledItems = updated.count }
+            guard var item = MarkdownParser.parseListItemLine(line) else {
+                guard MarkdownParser.isHorizontalWhitespaceOnly(line) else { return false }
+                continue
+            }
+            if !item.ordered, MarkdownParser.startsWithThematicBreakMarker(item.text),
+               MarkdownParser.isThematicBreak(line) {
+                return false
+            }
+            item.open = index == tailLines.count - 1
+            updated.append(item)
+        }
+        tailShape = .list(settledItems: nextSettledItems)
+        // The preceding item may have closed; every item before it is unchanged.
+        let changedStart = max(0, settledItems - 1)
+        if updated.count != items.count
+            || !updated[changedStart...].elementsEqual(items[changedStart...]) {
+            blocks[stableCount].setContent(.list(items: updated))
         }
         return true
+    }
+
+    /// Rewrites the open row and appends whatever rows the delta completed.
+    private func foldTableRows(fromLine openLine: Int) -> Bool {
+        // The header and delimiter rows are settled before a fold can run.
+        guard openLine >= 2,
+              case .table(let header, let rows) = blocks[stableCount].content,
+              rows.count == openLine - 2 || rows.count == openLine - 1
+        else { return false }
+
+        let settled = openLine - 2
+        var updated = Array(rows[..<settled])
+        updated.reserveCapacity(tailLines.count - 2)
+        for index in openLine..<tailLines.count {
+            let line = tailLines[index]
+            guard MarkdownParser.containsByte(line.utf8, 0x7C) else {
+                // A pipe-less line ends the table; only a blank one can do that
+                // without opening a second block in the tail.
+                guard index == tailLines.count - 1,
+                      MarkdownParser.isHorizontalWhitespaceOnly(line)
+                else { return false }
+                break
+            }
+            updated.append(MarkdownParser.parseTableCells(line))
+        }
+        if updated.count != rows.count
+            || !updated[settled...].elementsEqual(rows[settled...]) {
+            blocks[stableCount].setContent(.table(header: header, rows: updated))
+        }
+        return true
+    }
+
+    /// A fence body is copied verbatim, so the appended bytes are exactly what
+    /// the code gained — unless one of the new lines closes the fence.
+    private func foldCodeFence(
+        fromLine openLine: Int, marker: UInt8, appended: String.UTF8View.SubSequence
+    ) -> Bool {
+        // openLine == 0 is the opening fence still being typed; its bytes are the
+        // language, not code.
+        guard openLine >= 1,
+              case .codeBlock(let language, var code) = blocks[stableCount].content
+        else { return false }
+        for index in openLine..<tailLines.count
+        where MarkdownParser.hasFencePrefix(tailLines[index], marker) {
+            return false
+        }
+        code += String(decoding: appended, as: UTF8.self)
+        blocks[stableCount].setContent(.codeBlock(language: language, code: code))
+        return true
+    }
+
+    /// Extends the quote with the lines the delta completed. The block's own text
+    /// is trimmed, so the fold carries the untrimmed text of the settled lines and
+    /// re-derives the open line's contribution on top of it.
+    private func foldBlockQuote(settled: String, settledLines: Int) -> Bool {
+        let openLine = tailLines.count - 1
+        guard settledLines <= openLine else { return false }
+
+        var text = settled
+        for index in settledLines..<openLine {
+            // A blank line stays inside the quote only when another quoted line
+            // follows it, which the full parse resolves with a lookahead.
+            guard let quoted = MarkdownParser.blockQuoteLineContent(tailLines[index]) else {
+                return false
+            }
+            if index > 0 { text.append("\n") }
+            text += quoted
+        }
+        tailShape = .blockQuote(settled: text, settledLines: openLine)
+
+        if let quoted = MarkdownParser.blockQuoteLineContent(tailLines[openLine]) {
+            if openLine > 0 { text.append("\n") }
+            text += quoted
+        } else if !MarkdownParser.isHorizontalWhitespaceOnly(tailLines[openLine]) {
+            // Anything else ends the quote and opens a second block in the tail.
+            return false
+        }
+        setTailContent(.blockQuote(text: MarkdownParser.trimmedIfNeeded(text)))
+        return true
+    }
+
+    @inline(__always)
+    private func setTailContent(_ content: MarkdownBlockContent) {
+        if blocks[stableCount].content != content {
+            blocks[stableCount].setContent(content)
+        }
     }
 
     /// How many leading blocks are finalized. Normally all but the last — but a
@@ -354,23 +572,6 @@ public final class StableMarkdownParser {
             index += 1
         }
         return min(index, lines.count)
-    }
-
-    /// Full reconcile — used when text was replaced, not appended.
-    private func reconcileFull(_ newContents: [MarkdownBlockContent]) {
-        for i in 0..<min(blocks.count, newContents.count) {
-            if blocks[i].content != newContents[i] {
-                blocks[i].setContent(newContents[i])
-            }
-        }
-        if blocks.count > newContents.count {
-            blocks.removeSubrange(newContents.count...)
-        }
-        if newContents.count > blocks.count {
-            for i in blocks.count..<newContents.count {
-                blocks.append(StableBlock(content: newContents[i]))
-            }
-        }
     }
 
     /// Reconcile only from `startIndex` onward with new tail blocks.
@@ -543,6 +744,16 @@ struct MarkdownParser {
         character.isWhitespace || character == "\u{200B}"
     }
 
+    /// `trimmingCharacters(in: .whitespacesAndNewlines)` without its copy when
+    /// there is nothing to trim — the streaming case, where a growing block's
+    /// text is rebuilt on every flush.
+    @inline(__always)
+    static func trimmedIfNeeded(_ text: String) -> String {
+        let needsTrim = text.first.map(isTrimmableWhitespace) == true
+            || text.last.map(isTrimmableWhitespace) == true
+        return needsTrim ? text.trimmingCharacters(in: .whitespacesAndNewlines) : text
+    }
+
     /// Returns the first non-whitespace ASCII byte, `-1` for an empty/blank
     /// ASCII line, or `-2` when Unicode classification is required.
     @inline(__always)
@@ -709,7 +920,7 @@ extension MarkdownParser {
     /// True when `line`, ignoring leading whitespace, opens with three `marker`
     /// bytes — the closing-fence test, without the trimmed copy it used to make.
     @inline(__always)
-    private static func hasFencePrefix(_ line: String, _ marker: UInt8) -> Bool {
+    static func hasFencePrefix(_ line: String, _ marker: UInt8) -> Bool {
         let ascii = line.utf8.withContiguousStorageIfAvailable { buffer -> Bool? in
             var index = 0
             while index < buffer.count {
@@ -871,6 +1082,15 @@ extension MarkdownParser {
 
     // MARK: Block Quote
 
+    /// The quoted text of one line, or nil when the line isn't part of a quote.
+    /// Shared with the streaming parser, which folds one line at a time.
+    static func blockQuoteLineContent(_ line: String) -> Substring? {
+        let trimmed = trimmingHorizontalWhitespace(line)
+        guard trimmed.utf8.first == 0x3E else { return nil }
+        let content = trimmed.dropFirst(1)
+        return content.utf8.first == 0x20 ? content.dropFirst(1) : content
+    }
+
     static func parseBlockQuote(lines: [String], startIndex: Int) -> ParseResult {
         // Appends straight into the joined text: a streaming quote re-parses its
         // whole run on every flush, so the per-line array and `joined` it used to
@@ -879,15 +1099,13 @@ extension MarkdownParser {
         var hasQuotedLine = false
         var i = startIndex
         while i < lines.count {
-            let trimmed = trimmingHorizontalWhitespace(lines[i])
-            if trimmed.utf8.first == 0x3E {
-                let content = trimmed.dropFirst(1)
+            if let content = blockQuoteLineContent(lines[i]) {
                 if hasQuotedLine { text.append("\n") }
-                text += content.utf8.first == 0x20 ? content.dropFirst(1) : content
+                text += content
                 hasQuotedLine = true
-            } else if trimmed.isEmpty, hasQuotedLine {
+            } else if isHorizontalWhitespaceOnly(lines[i]), hasQuotedLine {
                 guard i + 1 < lines.count,
-                      trimmingHorizontalWhitespace(lines[i + 1]).utf8.first == 0x3E else {
+                      blockQuoteLineContent(lines[i + 1]) != nil else {
                     break
                 }
                 text.append("\n")
@@ -896,9 +1114,7 @@ extension MarkdownParser {
             }
             i += 1
         }
-        return ParseResult(
-            block: .blockQuote(text: text.trimmingCharacters(in: .whitespacesAndNewlines)),
-            nextIndex: i)
+        return ParseResult(block: .blockQuote(text: trimmedIfNeeded(text)), nextIndex: i)
     }
 
     // MARK: List
@@ -1204,10 +1420,26 @@ extension MarkdownParser {
         } ?? nil
     }
 
+    /// The trimmed cells of one table row. Shared with the streaming parser,
+    /// which folds one row at a time.
+    static func parseTableCells(_ line: String) -> [String] {
+        if let ascii = parseASCIITableCells(line) { return ascii }
+        let raw = trimmingHorizontalWhitespace(line)
+        let start = raw.first == "|" ? raw.index(after: raw.startIndex) : raw.startIndex
+        let end = raw.last == "|" && start != raw.endIndex
+            ? raw.index(before: raw.endIndex)
+            : raw.endIndex
+        let cells = start == raw.startIndex && end == raw.endIndex
+            ? raw
+            : String(raw[start..<end])
+        return splitASCII(cells, separator: 0x7C).map {
+            trimmingHorizontalWhitespace($0)
+        }
+    }
+
     static func parseTable(lines: [String], startIndex: Int) -> ParseResult? {
         guard startIndex + 1 < lines.count else { return nil }
 
-        let headerLine = lines[startIndex]
         // A GFM table delimiter row is composed ENTIRELY of pipes, dashes,
         // colons, and whitespace. Whole-line validation prevents list items like
         // "- foo `a|b`" from being swallowed into an empty table.
@@ -1215,22 +1447,7 @@ extension MarkdownParser {
             return nil
         }
 
-        func parseCells(_ line: String) -> [String] {
-            if let ascii = parseASCIITableCells(line) { return ascii }
-            let raw = trimmingHorizontalWhitespace(line)
-            let start = raw.first == "|" ? raw.index(after: raw.startIndex) : raw.startIndex
-            let end = raw.last == "|" && start != raw.endIndex
-                ? raw.index(before: raw.endIndex)
-                : raw.endIndex
-            let cells = start == raw.startIndex && end == raw.endIndex
-                ? raw
-                : String(raw[start..<end])
-            return splitASCII(cells, separator: 0x7C).map {
-                trimmingHorizontalWhitespace($0)
-            }
-        }
-
-        let header = parseCells(headerLine)
+        let header = parseTableCells(lines[startIndex])
         guard !header.isEmpty else { return nil }
 
         var rows: [[String]] = []
@@ -1238,7 +1455,7 @@ extension MarkdownParser {
         var i = startIndex + 2
         while i < lines.count {
             guard containsByte(lines[i].utf8, 0x7C) else { break }
-            rows.append(parseCells(lines[i]))
+            rows.append(parseTableCells(lines[i]))
             i += 1
         }
 
@@ -1246,6 +1463,31 @@ extension MarkdownParser {
     }
 
     // MARK: Paragraph
+
+    static func paragraphEnds(before line: String) -> Bool {
+        let firstIndex = line.firstIndex(where: { !$0.isWhitespace })
+        let first = firstIndex.map { line[$0] }
+        let startsFence = firstIndex.map { index in
+            let suffix = line[index...]
+            return (first == "`" && suffix.hasPrefix("```"))
+                || (first == "~" && suffix.hasPrefix("~~~"))
+        } ?? false
+        return first == nil || first == "#" || startsFence || first == ">"
+            || ((first == "-" || first == "*" || first == "_") && isThematicBreak(line))
+    }
+
+    static func canAppendParagraphLines(_ lines: [String], from openLine: Int) -> Bool {
+        // A delimiter can reclassify the preceding line as a table header.
+        for index in max(0, openLine - 1)..<lines.count {
+            if index + 1 < lines.count, isTableDelimiterRow(lines[index + 1]) { return false }
+            if index > 0, paragraphEnds(before: lines[index]) {
+                guard index == lines.count - 1, isHorizontalWhitespaceOnly(lines[index]) else {
+                    return false
+                }
+            }
+        }
+        return true
+    }
 
     static func parseParagraph(lines: [String], startIndex: Int) -> ParseResult {
         var i = startIndex
@@ -1262,23 +1504,8 @@ extension MarkdownParser {
             // parse()'s loop. Consuming it renders the line as literal paragraph
             // text, which is also what CommonMark does for a non-heading "#…".
             if i > startIndex {
-                let firstIndex = line.firstIndex(where: { !$0.isWhitespace })
-                let first = firstIndex.map { line[$0] }
-                let startsFence = firstIndex.map { index in
-                    let suffix = line[index...]
-                    return (first == "`" && suffix.hasPrefix("```"))
-                        || (first == "~" && suffix.hasPrefix("~~~"))
-                } ?? false
-                if first == nil
-                    || first == "#"
-                    || startsFence
-                    || first == ">"
-                    || ((first == "-" || first == "*" || first == "_")
-                        && isThematicBreak(line)) {
-                    break
-                }
-                if i + 1 < lines.count,
-                   isTableDelimiterRow(lines[i + 1]) {
+                if paragraphEnds(before: line)
+                    || (i + 1 < lines.count && isTableDelimiterRow(lines[i + 1])) {
                     break
                 }
             }

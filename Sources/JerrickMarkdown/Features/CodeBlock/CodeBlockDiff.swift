@@ -1,40 +1,27 @@
 import Foundation
-import Highlightr
 import SwiftUI
 
-// MARK: - Highlightr engine
+// MARK: - Row highlighting
 
 enum DiffHighlighter {
-  private static let lightInstance: Highlightr? = make(theme: "atom-one-light")
-  private static let darkInstance: Highlightr? = make(theme: "atom-one-dark")
-
-  private static func make(theme: String) -> Highlightr? {
-    let h = Highlightr()
-    _ = h?.setTheme(to: theme)
-    h?.ignoreIllegals = true
-    return h
-  }
-
-  /// Returns a SwiftUI `AttributedString` with foreground colors only — fonts
-  /// and background colors from the Highlightr theme are stripped so the
-  /// caller's row tinting and font choice win.
-  static func highlight(_ code: String, language: String, dark: Bool) -> AttributedString? {
+  /// Colors one diff row through the shared native highlighter, so a row and a
+  /// plain code block color an identical line identically. Foreground colors
+  /// only — the caller owns the font and the add/delete row tint.
+  static func highlight(_ code: String, language: String) -> AttributedString? {
     guard !code.isEmpty else { return nil }
-    let h = dark ? darkInstance : lightInstance
-    guard let ns = h?.highlight(code, as: language, fastRender: true) else { return nil }
-    let mutable = NSMutableAttributedString(attributedString: ns)
-    let full = NSRange(location: 0, length: mutable.length)
-    mutable.removeAttribute(.font, range: full)
-    mutable.removeAttribute(.backgroundColor, range: full)
-    return AttributedString(mutable)
+    guard let lines = NativeSyntaxHighlighter.lines(code: code, language: language),
+      lines.count == 1
+    else { return nil }
+    return lines.first
   }
 }
 
 // MARK: - Unified Diff View
 
 /// Renders a parsed unified diff as a gutter + `+`/`−` prefixed, syntax-tinted
-/// list of rows. Used as the body of a `CodeBlock` in diff mode (the edit-tool
-/// dropdown and any `diff`-fenced markdown block).
+/// list of rows. Used as the body of a `CodeBlock` in diff mode — the edit-tool
+/// dropdown. (A `diff`-fenced markdown block is a normal code block coloured by
+/// `SyntaxMode.diff`, not this view.)
 struct UnifiedDiffView: View {
   let lines: [MarkdownDiffLine]
   let language: String
@@ -169,9 +156,7 @@ private struct DiffRowView: View {
   private var codeText: some View {
     if line.content.isEmpty {
       Text(" ").foregroundStyle(theme.diff.text.resolve(for: colorScheme))
-    } else if let attr = DiffHighlighter.highlight(
-      line.content, language: language, dark: colorScheme == .dark)
-    {
+    } else if let attr = DiffHighlighter.highlight(line.content, language: language) {
       Text(attr)
     } else {
       Text(line.content).foregroundStyle(theme.diff.text.resolve(for: colorScheme))

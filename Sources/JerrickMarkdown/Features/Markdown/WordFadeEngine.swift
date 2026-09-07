@@ -313,7 +313,6 @@ final class WordFadeEngine {
   }
 
   private var hasActiveWords: Bool { firstActiveWord < words.count }
-  private var activeWordCount: Int { max(0, words.count - firstActiveWord) }
   private var activeLastStart: TimeInterval? {
     hasActiveWords ? words[words.count - 1].start : nil
   }
