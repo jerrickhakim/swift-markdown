@@ -232,6 +232,12 @@ struct SelectableMarkdownText: UIViewRepresentable {
   var lineSpacing: CGFloat = 5
   var isStreaming: Bool = false
   var alignment: MarkdownAlignment = .leading
+  /// Answer SwiftUI's ideal-size probe (nil / infinite width) with the
+  /// unwrapped text size. Only Grid cells need it — a column has to size to
+  /// its text. Prose keeps returning nil there: the probe would otherwise
+  /// cost a full unbounded layout per flush and thrash the width-keyed cache
+  /// against the real width.
+  var answersIdealWidth: Bool = false
 
   @Environment(\.openURL) private var openURL
 
@@ -268,11 +274,9 @@ struct SelectableMarkdownText: UIViewRepresentable {
     _ proposal: ProposedViewSize, uiView: SelectableTextView, context: Context
   ) -> CGSize? {
     guard proposal.width != 0 else { return nil }
-    // A nil or infinite width is SwiftUI's ideal-size probe (a Grid sizing
-    // its columns, a horizontal ScrollView); answer with the unwrapped text
-    // size so the ideal and final measurements agree.
-    let width = proposal.width.map { $0.isFinite ? $0 : .greatestFiniteMagnitude }
-      ?? CGFloat.greatestFiniteMagnitude
+    let bounded = proposal.width.flatMap { $0.isFinite ? $0 : nil }
+    guard bounded != nil || answersIdealWidth else { return nil }
+    let width = bounded ?? CGFloat.greatestFiniteMagnitude
     // A streaming block whose committed text draws nothing yet (holdback,
     // dangling markers) must occupy ZERO height — UITextView would otherwise
     // reserve a full empty line, and that phantom line is what used to shift

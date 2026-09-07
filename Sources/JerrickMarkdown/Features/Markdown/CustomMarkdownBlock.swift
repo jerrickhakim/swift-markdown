@@ -543,7 +543,8 @@ private struct MarkdownTable: View {
     // takes on these cells, so cells carry the same SelectableTextView that
     // gives real grabber-handle selection everywhere else in the chat.
     return SelectableMarkdownText(
-      markdown: text, style: inline, lineSpacing: style.baseSize * 0.25
+      markdown: text, style: inline, lineSpacing: style.baseSize * 0.25,
+      answersIdealWidth: true
     )
     .frame(minWidth: 80, maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     .padding(.vertical, 10)
