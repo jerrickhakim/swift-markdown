@@ -36,6 +36,7 @@ public enum MarkdownBlockContent: Equatable, Sendable {
     case heading(level: Int, text: String, alignment: MarkdownAlignment)
     case paragraph(text: String, alignment: MarkdownAlignment)
     case codeBlock(language: String?, code: String)
+    case visualization(reference: MarkdownVisualizationReference?, source: String)
     case blockQuote(text: String)
     /// A contiguous run of list items (ordered/unordered/mixed depths) parsed
     /// as ONE block. Item-per-block parsing made every list line its own
@@ -67,6 +68,7 @@ public enum MarkdownBlockContent: Equatable, Sendable {
         case .math:              return "math"
         case .table:             return "table"
         case .details:           return "details"
+        case .visualization:     return "visualization"
         }
     }
 
@@ -802,7 +804,7 @@ struct MarkdownParser {
               let first = markdown.first,
               let last = markdown.last,
               !isTrimmableWhitespace(first),
-              first != "`", first != "~", first != "$", first != "<",
+              first != "`", first != "~", first != "$", first != "<", first != "",
               first != "-", first != "*", first != "_", first != "#",
               first != ">", first != "+", !first.isNumber else {
             return nil
@@ -826,6 +828,9 @@ struct MarkdownParser {
             ? line.first(where: { !$0.isWhitespace })
             : nil
 
+        if unicodeFirst == "", let block = parseVisualization(line) {
+            return SourceParseResult(block: block, nextIndex: startIndex + 1)
+        }
         if leadingByte == 0x60 || leadingByte == 0x7E
             || unicodeFirst == "`" || unicodeFirst == "~",
            let result = parseFencedCodeBlock(lines: lines, startIndex: startIndex) {
@@ -1473,6 +1478,7 @@ extension MarkdownParser {
                 || (first == "~" && suffix.hasPrefix("~~~"))
         } ?? false
         return first == nil || first == "#" || startsFence || first == ">"
+            || (first == "" && isVisualizationCandidate(line))
             || ((first == "-" || first == "*" || first == "_") && isThematicBreak(line))
     }
 

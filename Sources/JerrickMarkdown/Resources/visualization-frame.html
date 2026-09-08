@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{{policy}}">
+<style>:root{color-scheme:light dark}body{margin:0}iframe{width:{{width}};height:240px;border:0;display:block}</style>
+</head><body><iframe id="preview" title="Interactive preview" sandbox="allow-scripts" srcdoc="{{content}}"></iframe>
+<script>
+const frame=document.getElementById('preview');
+window.addEventListener('message',event=>{
+  if(event.source!==frame.contentWindow)return;
+  const h=event.data&&event.data.previewHeight;
+  if(typeof h!=='number'||!Number.isFinite(h))return;
+  const height=Math.max(80,Math.min(10000,h));frame.style.height=height+'px';
+  window.webkit.messageHandlers.previewHeight.postMessage(height);
+});
+</script></body></html>

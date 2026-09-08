@@ -78,6 +78,13 @@ public struct CustomMarkdownBlock: View {
         alignment: alignment
       )
 
+    case .visualization(let reference, let source):
+      if let reference {
+        MarkdownVisualizationView(reference: reference)
+      } else if !isStreamingTail {
+        StreamingMarkdownText(markdown: source, style: style.inline, isStreamingTail: false)
+      }
+
     case .heading(let level, let text, let alignment):
       StreamingMarkdownText(
         markdown: text,
@@ -144,6 +151,8 @@ public struct CustomMarkdownBlock: View {
       return streamingTextRendersEmpty(text)
     case .blockQuote(let text):
       return streamingTextRendersEmpty(text)
+    case .visualization(let reference, _):
+      return reference == nil
     case .math(let latex, let complete):
       // A math fence that hasn't closed yet (or has no LaTeX) draws nothing —
       // keep it flat until the closing `$$` arrives and it pops in.
