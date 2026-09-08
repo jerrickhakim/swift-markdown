@@ -1,6 +1,11 @@
 import Foundation
 
 enum VisualizationDocument {
+  static func isInternalURL(_ url: URL?) -> Bool {
+    // Foundation gives opaque about: URLs no path component.
+    url?.absoluteString == "about:blank" || url?.absoluteString == "about:srcdoc"
+  }
+
   static func wrap(_ fragment: String, wide: Bool = false) throws -> String {
     let sources = "https://cdnjs.cloudflare.com https://esm.sh https://cdn.jsdelivr.net https://unpkg.com https://fonts.googleapis.com https://fonts.gstatic.com https://fonts.bunny.net"
     let policy = "default-src 'none'; script-src 'unsafe-inline' \(sources); style-src 'unsafe-inline' \(sources); img-src data: blob: \(sources); font-src data: \(sources); connect-src 'none'; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"

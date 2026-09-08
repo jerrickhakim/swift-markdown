@@ -57,4 +57,15 @@ final class MarkdownVisualizationTests: XCTestCase {
     XCTAssertTrue(document.contains("connect-src 'none'"))
     XCTAssertFalse(document.contains("allow-same-origin"))
   }
+
+  func testOpaqueDocumentURLsAreAllowedWithoutOpeningOtherNavigation() {
+    for text in ["about:blank", "about:srcdoc"] {
+      XCTAssertTrue(VisualizationDocument.isInternalURL(URL(string: text)), text)
+    }
+    for text in ["https://example.com", "file:///preview.html", "data:text/html,test",
+                 "about:blank/other", "about:srcdoc?other", "repogo://workspaces"] {
+      XCTAssertFalse(VisualizationDocument.isInternalURL(URL(string: text)), text)
+    }
+    XCTAssertFalse(VisualizationDocument.isInternalURL(nil))
+  }
 }

@@ -160,8 +160,6 @@ private final class VisualizationSession: NSObject, ObservableObject, WKScriptMe
       view.scrollView.backgroundColor = .clear
       webView = view
       view.loadHTMLString(try VisualizationDocument.wrap(html, wide: wide), baseURL: nil)
-      ready = true
-      loading = false
     } catch is CancellationError {
       // A replacement task owns the next state.
     } catch {
@@ -193,10 +191,15 @@ private final class VisualizationSession: NSObject, ObservableObject, WKScriptMe
 
   func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-    let url = navigationAction.request.url
     let allowed = navigationAction.navigationType == .other
-      && url?.scheme == "about" && (url?.path == "blank" || url?.path == "srcdoc")
+      && VisualizationDocument.isInternalURL(navigationAction.request.url)
     decisionHandler(allowed ? .allow : .cancel)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    guard webView === self.webView else { return }
+    ready = true
+    loading = false
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
