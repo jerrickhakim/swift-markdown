@@ -1,7 +1,8 @@
 import Foundation
 
 enum MarkdownFileCitation {
-  private static let opening = Array(":codex-file-citation{")
+  static let openingUTF8 = Array(":codex-file-citation{".utf8)
+  private static let opening = Array(String(decoding: openingUTF8, as: UTF8.self))
 
   static func scan(_ chars: [Character], at start: Int) -> (end: Int, path: String?)? {
     guard chars.count - start >= opening.count,

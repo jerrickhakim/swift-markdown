@@ -53,6 +53,13 @@ private extension EnvironmentValues {
   }
 }
 
+private struct VisualizationLoadID: Hashable {
+  let source: AnyHashable?
+  let path: String
+  let retry: Int
+  let wide: Bool
+}
+
 struct MarkdownVisualizationView: View {
   let reference: MarkdownVisualizationReference
   @Environment(\.visualizationLoader) private var loader
@@ -63,12 +70,12 @@ struct MarkdownVisualizationView: View {
   @State private var expanded = false
   @State private var inlineExpanded = false
   @State private var retry = 0
+  @State private var requested = false
 
-  private struct LoadID: Hashable {
-    let source: AnyHashable?
-    let path: String
-    let retry: Int
-    let wide: Bool
+  private var request: VisualizationLoadID? {
+    guard requested else { return nil }
+    return VisualizationLoadID(source: loader?.id, path: reference.path,
+                               retry: retry, wide: reference.mode == "wide")
   }
 
   private var title: String {
@@ -95,6 +102,7 @@ struct MarkdownVisualizationView: View {
 
         Button {
           UIImpactFeedbackGenerator(style: .light).impactOccurred()
+          requested = true
           withAnimation(reduceMotion ? nil : expansionAnimation) {
             inlineExpanded.toggle()
           }
@@ -140,8 +148,9 @@ struct MarkdownVisualizationView: View {
         .padding(.top, 8)
       }
     }
-    .task(id: LoadID(source: loader?.id, path: reference.path, retry: retry, wide: reference.mode == "wide")) {
-      await session.load(path: reference.path, wide: reference.mode == "wide", loader: loader)
+    .task(id: request) {
+      guard let request else { return }
+      await session.load(request, loader: loader)
     }
     .sheet(isPresented: $expanded) {
       NavigationStack {
@@ -163,22 +172,24 @@ struct MarkdownVisualizationView: View {
   }
 
   private func openSheet() {
+    requested = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     expanded = true
   }
 
   @ViewBuilder
   private var previewContent: some View {
-    if session.ready {
+    switch session.state {
+    case .ready:
       VisualizationWebView(session: session)
-    } else if session.loading {
+    case .idle, .loading:
       ProgressView("Loading preview…")
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    } else {
+    case .empty, .unavailable:
       VStack(spacing: 12) {
-        Text(session.message ?? "Preview unavailable")
+        Text(session.state == .empty ? "Preview is empty" : "Preview unavailable")
           .foregroundStyle(.secondary)
-        if loader != nil && !session.empty {
+        if loader != nil && session.state == .unavailable {
           Button("Retry") { retry += 1 }
         }
       }
@@ -190,34 +201,37 @@ struct MarkdownVisualizationView: View {
 @MainActor
 private final class VisualizationSession: NSObject, ObservableObject, WKScriptMessageHandler,
   WKNavigationDelegate {
-  @Published var height: CGFloat = 240
-  @Published var loading = false
-  @Published var ready = false
-  @Published var empty = false
-  @Published var message: String?
-  private(set) var webView: WKWebView?
+  enum State { case idle, loading, ready, empty, unavailable }
 
-  func load(path: String, wide: Bool, loader: VisualizationLoader?) async {
+  @Published private(set) var height: CGFloat = 240
+  @Published private(set) var state: State = .idle
+  private(set) var webView: WKWebView?
+  private var loadedID: VisualizationLoadID?
+  private var loadGeneration: UInt64 = 0
+
+  func load(_ request: VisualizationLoadID, loader: VisualizationLoader?) async {
+    guard loadedID != request || state == .loading else { return }
     reset()
+    loadedID = request
+    let generation = loadGeneration
     guard let loader else {
-      message = "Preview unavailable"
+      state = .unavailable
       return
     }
-    loading = true
+    state = .loading
     do {
-      let html = try await loader.load(path)
+      let html = try await loader.load(request.path)
       try Task.checkCancellation()
+      guard generation == loadGeneration else { return }
       guard html.utf8.count <= 1_048_576 else {
-        loading = false
-        message = "Preview unavailable"
+        state = .unavailable
         return
       }
-      if html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        loading = false
-        empty = true
-        message = "Preview is empty"
+      guard !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        state = .empty
         return
       }
+      let document = try VisualizationDocument.wrap(html, wide: request.wide)
       let configuration = WKWebViewConfiguration()
       configuration.websiteDataStore = .nonPersistent()
       configuration.userContentController.add(VisualizationMessageRelay(self), name: "previewHeight")
@@ -227,25 +241,25 @@ private final class VisualizationSession: NSObject, ObservableObject, WKScriptMe
       view.backgroundColor = .clear
       view.scrollView.backgroundColor = .clear
       webView = view
-      view.loadHTMLString(try VisualizationDocument.wrap(html, wide: wide), baseURL: nil)
-    } catch is CancellationError {
-      // A replacement task owns the next state.
+      view.loadHTMLString(document, baseURL: nil)
     } catch {
-      guard !Task.isCancelled else { return }
-      loading = false
-      message = "Preview unavailable"
+      guard generation == loadGeneration else { return }
+      if Task.isCancelled || error is CancellationError {
+        reset()
+      } else {
+        state = .unavailable
+      }
     }
   }
 
   private func reset() {
-    webView?.stopLoading()
+    loadGeneration &+= 1
     webView?.navigationDelegate = nil
+    webView?.stopLoading()
     webView?.configuration.userContentController.removeScriptMessageHandler(forName: "previewHeight")
     webView = nil
-    loading = false
-    ready = false
-    empty = false
-    message = nil
+    loadedID = nil
+    state = .idle
     height = 240
   }
 
@@ -266,8 +280,7 @@ private final class VisualizationSession: NSObject, ObservableObject, WKScriptMe
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
     guard webView === self.webView else { return }
-    ready = true
-    loading = false
+    state = .ready
   }
 
   func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
@@ -285,9 +298,7 @@ private final class VisualizationSession: NSObject, ObservableObject, WKScriptMe
 
   private func failed(_ view: WKWebView) {
     guard view === webView else { return }
-    ready = false
-    loading = false
-    message = "Preview unavailable"
+    state = .unavailable
   }
 }
 

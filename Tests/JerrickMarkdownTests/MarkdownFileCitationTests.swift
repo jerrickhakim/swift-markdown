@@ -36,4 +36,14 @@ final class MarkdownFileCitationTests: XCTestCase {
     }
     XCTAssertTrue(InlineMarkdown.traitRuns(citation, isTail: true).contains(where: \.isLink))
   }
+
+  func testCitationAfterColonsAndPartialPrefixes() {
+    for prefix in ["Time: 10:30. ", ":", ":codex-file-", "!", "ordinary prose "] {
+      let runs = InlineMarkdown.traitRuns(prefix + citation)
+      XCTAssertEqual(runs.map(\.text).joined(), prefix + "📄 report 100%.pdf")
+      XCTAssertEqual(runs.filter(\.isLink).count, 1)
+    }
+    let ordinary = "Time: 10:30. :codex-file-citatio is not a citation."
+    XCTAssertEqual(InlineMarkdown.traitRuns(ordinary).map(\.text).joined(), ordinary)
+  }
 }

@@ -123,10 +123,14 @@ public enum InlineMarkdown {
   /// Fast path for prose with no tokenizer-triggering ASCII. Strings containing
   /// any possible syntax marker fall through to the full streaming-tolerant parser.
   private static func plainTraitRunsFastPath(_ markdown: String, isTail: Bool) -> [TraitRun]? {
-    if markdown.contains(":codex-file-citation{") { return nil }
+    let citationOpening = MarkdownFileCitation.openingUTF8
+    var citationPrefix = 0
     var hasEntity = false
     var previousWasBang = false
     for byte in markdown.utf8 {
+      citationPrefix = byte == citationOpening[citationPrefix]
+        ? citationPrefix + 1 : (byte == citationOpening[0] ? 1 : 0)
+      if citationPrefix == citationOpening.count { return nil }
       if previousWasBang, byte == 91 { return nil }  // ![
       switch byte {
       case 38:  // &
