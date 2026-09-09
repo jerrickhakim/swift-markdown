@@ -14,10 +14,6 @@ private struct VisualizationCardFillKey: EnvironmentKey {
   static let defaultValue: Color = Color.primary.opacity(0.08)
 }
 
-private struct VisualizationScopeKey: EnvironmentKey {
-  static let defaultValue: AnyView? = nil
-}
-
 extension View {
   public func markdownVisualizationCardFill(_ color: Color) -> some View {
     environment(\.visualizationCardFill, color)
@@ -29,12 +25,6 @@ extension View {
     load: @escaping @MainActor (String) async throws -> String
   ) -> some View {
     environment(\.visualizationLoader, VisualizationLoader(id: id, load: load))
-  }
-
-  public func markdownVisualizationScope<Scope: View>(
-    @ViewBuilder _ scope: () -> Scope
-  ) -> some View {
-    environment(\.visualizationScope, AnyView(scope()))
   }
 }
 
@@ -48,20 +38,15 @@ private extension EnvironmentValues {
     get { self[VisualizationLoaderKey.self] }
     set { self[VisualizationLoaderKey.self] = newValue }
   }
-
-  var visualizationScope: AnyView? {
-    get { self[VisualizationScopeKey.self] }
-    set { self[VisualizationScopeKey.self] = newValue }
-  }
 }
 
 struct MarkdownVisualizationView: View {
   let reference: MarkdownVisualizationReference
   @Environment(\.visualizationLoader) private var loader
-  @Environment(\.visualizationScope) private var scope
   @Environment(\.visualizationCardFill) private var cardFill
   @StateObject private var session = VisualizationSession()
   @State private var expanded = false
+  @State private var inlineExpanded = false
   @State private var retry = 0
 
   private struct LoadID: Hashable {
@@ -77,50 +62,66 @@ struct MarkdownVisualizationView: View {
   }
 
   var body: some View {
-    Button { expanded = true } label: {
-      HStack(spacing: 12) {
-        Text(title)
-          .font(.subheadline.weight(.medium))
-          .lineLimit(2)
-          .multilineTextAlignment(.leading)
-        Spacer(minLength: 12)
-        Image(systemName: "globe")
-          .font(.system(size: 32, weight: .light))
-          .rotationEffect(.degrees(29))
-          .offset(x: 3, y: 3)
-          .accessibilityHidden(true)
-        Image(systemName: "chevron.down")
-          .font(.system(size: 12, weight: .semibold))
-          .foregroundStyle(.secondary)
-          .accessibilityHidden(true)
+    VStack(spacing: 0) {
+      HStack(spacing: 0) {
+        Button { expanded = true } label: {
+          HStack(spacing: 12) {
+            Text(title)
+              .font(.subheadline.weight(.medium))
+              .lineLimit(2)
+              .multilineTextAlignment(.leading)
+            Spacer(minLength: 12)
+            Image(systemName: "globe")
+              .font(.system(size: 32, weight: .light))
+              .rotationEffect(.degrees(29))
+              .offset(x: 3, y: 3)
+              .accessibilityHidden(true)
+          }
+          .foregroundStyle(.primary)
+          .padding(16)
+          .frame(maxWidth: .infinity, minHeight: 64)
+          .contentShape(Rectangle())
+        }
+        .accessibilityHint("Opens preview sheet")
+
+        Button { inlineExpanded.toggle() } label: {
+          Image(systemName: inlineExpanded ? "chevron.up" : "chevron.down")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 48, height: 64)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel(inlineExpanded ? "Collapse preview" : "Expand preview inline")
       }
-      .foregroundStyle(.primary)
-      .padding(16)
-      .frame(maxWidth: .infinity, minHeight: 64)
+      .buttonStyle(.plain)
       .background(cardFill, in: RoundedRectangle(cornerRadius: 16))
-      .contentShape(RoundedRectangle(cornerRadius: 16))
+
+      if inlineExpanded {
+        Group {
+          if expanded {
+            Color.clear
+          } else {
+            previewContent
+          }
+        }
+        .frame(height: min(480, max(80, session.height)))
+        .padding(.top, 8)
+      }
     }
-    .buttonStyle(.plain)
-    .accessibilityHint("Opens preview")
     .task(id: LoadID(source: loader?.id, path: reference.path, retry: retry, wide: reference.mode == "wide")) {
       await session.load(path: reference.path, wide: reference.mode == "wide", loader: loader)
     }
     .sheet(isPresented: $expanded) {
       NavigationStack {
-        sheetContent
+        previewContent
           .navigationTitle(title)
           .navigationBarTitleDisplayMode(.inline)
           .toolbar {
-            if let scope {
-              ToolbarItem(placement: .principal) {
-                VStack(spacing: 2) {
-                  scope
-                  Text(title).font(.caption).foregroundStyle(.secondary)
-                }
+            ToolbarItem(placement: .topBarLeading) {
+              Button { expanded = false } label: {
+                Image(systemName: "xmark")
               }
-            }
-            ToolbarItem(placement: .confirmationAction) {
-              Button("Done") { expanded = false }
+              .accessibilityLabel("Close preview")
             }
           }
       }
@@ -128,7 +129,7 @@ struct MarkdownVisualizationView: View {
   }
 
   @ViewBuilder
-  private var sheetContent: some View {
+  private var previewContent: some View {
     if session.ready {
       VisualizationWebView(session: session)
     } else if session.loading {
