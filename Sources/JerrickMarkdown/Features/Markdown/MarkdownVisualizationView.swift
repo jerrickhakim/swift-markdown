@@ -125,6 +125,8 @@ struct MarkdownVisualizationView: View {
             }
           }
       }
+      .presentationDetents([.medium, .large])
+      .presentationDragIndicator(.visible)
     }
   }
 
