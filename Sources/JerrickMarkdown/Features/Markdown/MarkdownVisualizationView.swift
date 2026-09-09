@@ -64,7 +64,10 @@ struct MarkdownVisualizationView: View {
   var body: some View {
     VStack(spacing: 0) {
       HStack(spacing: 0) {
-        Button { expanded = true } label: {
+        Button {
+          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+          expanded = true
+        } label: {
           HStack(spacing: 12) {
             Text(title)
               .font(.subheadline.weight(.medium))
@@ -84,7 +87,10 @@ struct MarkdownVisualizationView: View {
         }
         .accessibilityHint("Opens preview sheet")
 
-        Button { inlineExpanded.toggle() } label: {
+        Button {
+          UIImpactFeedbackGenerator(style: .light).impactOccurred()
+          inlineExpanded.toggle()
+        } label: {
           Image(systemName: inlineExpanded ? "chevron.up" : "chevron.down")
             .font(.system(size: 12, weight: .semibold))
             .foregroundStyle(.secondary)
