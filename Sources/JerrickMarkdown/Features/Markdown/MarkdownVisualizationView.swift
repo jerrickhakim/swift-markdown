@@ -73,7 +73,7 @@ struct MarkdownVisualizationView: View {
             Spacer(minLength: 12)
             Image(systemName: "globe")
               .font(.system(size: 32, weight: .light))
-              .rotationEffect(.degrees(29))
+              .rotationEffect(.degrees(15))
               .offset(x: 3, y: 3)
               .accessibilityHidden(true)
           }
