@@ -14,7 +14,15 @@ private struct VisualizationCardFillKey: EnvironmentKey {
   static let defaultValue: Color = Color.primary.opacity(0.08)
 }
 
+private struct VisualizationExpansionAnimationKey: EnvironmentKey {
+  static let defaultValue: Animation? = nil
+}
+
 extension View {
+  public func markdownVisualizationExpansionAnimation(_ animation: Animation?) -> some View {
+    environment(\.visualizationExpansionAnimation, animation)
+  }
+
   public func markdownVisualizationCardFill(_ color: Color) -> some View {
     environment(\.visualizationCardFill, color)
   }
@@ -29,6 +37,11 @@ extension View {
 }
 
 private extension EnvironmentValues {
+  var visualizationExpansionAnimation: Animation? {
+    get { self[VisualizationExpansionAnimationKey.self] }
+    set { self[VisualizationExpansionAnimationKey.self] = newValue }
+  }
+
   var visualizationCardFill: Color {
     get { self[VisualizationCardFillKey.self] }
     set { self[VisualizationCardFillKey.self] = newValue }
@@ -44,6 +57,8 @@ struct MarkdownVisualizationView: View {
   let reference: MarkdownVisualizationReference
   @Environment(\.visualizationLoader) private var loader
   @Environment(\.visualizationCardFill) private var cardFill
+  @Environment(\.visualizationExpansionAnimation) private var expansionAnimation
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @StateObject private var session = VisualizationSession()
   @State private var expanded = false
   @State private var inlineExpanded = false
@@ -64,15 +79,38 @@ struct MarkdownVisualizationView: View {
   var body: some View {
     VStack(spacing: 0) {
       HStack(spacing: 0) {
+        Button(action: openSheet) {
+          Text(title)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.primary)
+            .lineLimit(2)
+            .multilineTextAlignment(.leading)
+            .padding(.leading, 16)
+            .padding(.vertical, 16)
+            .frame(minHeight: 64)
+            .contentShape(Rectangle())
+        }
+        .layoutPriority(1)
+        .accessibilityHint("Opens preview sheet")
+
         Button {
           UIImpactFeedbackGenerator(style: .light).impactOccurred()
-          expanded = true
+          withAnimation(reduceMotion ? nil : expansionAnimation) {
+            inlineExpanded.toggle()
+          }
         } label: {
-          HStack(spacing: 12) {
-            Text(title)
-              .font(.subheadline.weight(.medium))
-              .lineLimit(2)
-              .multilineTextAlignment(.leading)
+          Image(systemName: inlineExpanded
+            ? "arrow.down.right.and.arrow.up.left"
+            : "arrow.up.left.and.arrow.down.right")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: 44, height: 64)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel(inlineExpanded ? "Collapse preview" : "Expand preview inline")
+
+        Button(action: openSheet) {
+          HStack {
             Spacer(minLength: 12)
             Image(systemName: "globe")
               .font(.system(size: 32, weight: .light))
@@ -81,23 +119,11 @@ struct MarkdownVisualizationView: View {
               .accessibilityHidden(true)
           }
           .foregroundStyle(.primary)
-          .padding(16)
+          .padding(.trailing, 16)
           .frame(maxWidth: .infinity, minHeight: 64)
           .contentShape(Rectangle())
         }
-        .accessibilityHint("Opens preview sheet")
-
-        Button {
-          UIImpactFeedbackGenerator(style: .light).impactOccurred()
-          inlineExpanded.toggle()
-        } label: {
-          Image(systemName: inlineExpanded ? "chevron.up" : "chevron.down")
-            .font(.system(size: 12, weight: .semibold))
-            .foregroundStyle(.secondary)
-            .frame(width: 48, height: 64)
-            .contentShape(Rectangle())
-        }
-        .accessibilityLabel(inlineExpanded ? "Collapse preview" : "Expand preview inline")
+        .accessibilityLabel("Open preview sheet")
       }
       .buttonStyle(.plain)
       .background(cardFill, in: RoundedRectangle(cornerRadius: 16))
@@ -134,6 +160,11 @@ struct MarkdownVisualizationView: View {
       .presentationDetents([.medium, .large])
       .presentationDragIndicator(.visible)
     }
+  }
+
+  private func openSheet() {
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    expanded = true
   }
 
   @ViewBuilder
